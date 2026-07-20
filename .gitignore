@@ -1,0 +1,12 @@
+build/
+dist/
+output/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+*.exe
+*.spec
+.DS_Store
+Thumbs.db
+.claude/
