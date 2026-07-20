@@ -7,10 +7,10 @@ on:
 
 jobs:
   build:
-    runs-on: windows-2019  # Windows 7 兼容
+    runs-on: windows-latest  # 暂用最新 runner 避免排队
     strategy:
       matrix:
-        python-version: ["3.8"]
+        python-version: ["3.11"]
 
     steps:
       - name: Checkout code
