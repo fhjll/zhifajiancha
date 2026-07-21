@@ -62,6 +62,12 @@ def _safe_float(v: str, default: float) -> float:
         return default
 
 
+def _parse_multi_account(account_str: str):
+    """解析逗号分隔的多账户字符串，返回列表（多个）或字符串（单个）"""
+    parts = [a.strip() for a in account_str.split(',') if a.strip()]
+    return parts if len(parts) > 1 else (parts[0] if parts else account_str)
+
+
 def _safe_int(v: str, default: int) -> int:
     try:
         return int(v.strip())
@@ -335,7 +341,8 @@ class App(ctk.CTk):
         row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
         row_f.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(row_f, text="划转账户", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
-        ctk.CTkEntry(row_f, textvariable=self.settlement_check_account).grid(
+        ctk.CTkEntry(row_f, textvariable=self.settlement_check_account,
+                     placeholder_text="多账户用逗号分隔，如: 待报解预算收入,国库经收处").grid(
             row=0, column=1, columnspan=2, sticky="ew", padx=(0, 6))
         r += 1
 
@@ -1127,7 +1134,7 @@ class App(ctk.CTk):
 
         results = detect_settlement_verification(
             file_path=file_path,
-            designated_account=account_name,
+            designated_account=_parse_multi_account(account_name),
             days_threshold=threshold,
         )
 

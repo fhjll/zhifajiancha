@@ -304,7 +304,7 @@ def main():
     parser.add_argument(
         "--settlement-account",
         default="待报解预算收入",
-        help="清算核查的指定划转账户名称 (默认: 待报解预算收入)",
+        help="清算核查的指定划转账户名称，多个用逗号分隔 (默认: 待报解预算收入)",
     )
     parser.add_argument(
         "--settlement-days",
@@ -376,6 +376,12 @@ def main():
             print(f"  {fp}")
         return
 
+    # 解析逗号分隔的多账户
+    settlement_account_list = None
+    if args.settlement_account:
+        parts = [a.strip() for a in args.settlement_account.split(',') if a.strip()]
+        settlement_account_list = parts if len(parts) > 1 else args.settlement_account
+
     run_pipeline(
         zero_balance_path=args.zero_balance,
         qing_suan_path=args.qing_suan,
@@ -389,7 +395,7 @@ def main():
         non_tax_account=args.non_tax_account or None,
         non_tax_days=args.non_tax_days,
         settlement_check=args.settlement_check or None,
-        settlement_account=args.settlement_account,
+        settlement_account=settlement_account_list or args.settlement_account,
         settlement_days=args.settlement_days,
         max_workers=args.workers,
     )

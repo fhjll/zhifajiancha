@@ -1547,16 +1547,16 @@ def detect_non_tax_verification(
 
 def detect_settlement_verification(
     file_path: str,
-    designated_account: str = '待报解预算收入',
+    designated_account = '待报解预算收入',
     days_threshold: int = 2,
 ) -> pd.DataFrame:
     """
     清算核查：对单个流水文件，检查来账后指定工作日内是否有划转到指定账户的出账。
 
     校验逻辑：
-    1. 筛选所有来账（收入/贷，金额>0），排除对方户名==指定账户的记录（内部调拨）
+    1. 筛选所有来账（收入/贷，金额>0），排除对方户名为指定账户的记录（内部调拨）
     2. 对于每条来账，检查其日期后的 days_threshold 个工作日内（含当天），
-       是否存在至少一笔出账（借，金额<0）且交易对象为指定账户
+       是否存在至少一笔出账（借，金额<0）且交易对象为任一指定账户
     3. 若不存在 → 标记为可疑
 
     注意：此检查不涉及金额匹配，仅判断是否有向指定账户的划转行为。
@@ -1565,8 +1565,9 @@ def detect_settlement_verification(
     ----------
     file_path : str
         流水文件路径（CSV 或 Excel）
-    designated_account : str
-        指定划转账户的对方户名；默认 "待报解预算收入"
+    designated_account : str 或 list[str]
+        指定划转账户的对方户名，支持多个（如 ['待报解预算收入', '国库经收处']）；
+        默认 "待报解预算收入"
     days_threshold : int
         工作日阈值（默认 2）。来账后此工作日内无划转 → 标记"可疑"
 
@@ -1627,22 +1628,30 @@ def detect_settlement_verification(
                 break
 
     # ================================================================
-    # 2. 分类：来账 + 划转出账日期集合
+    # 2. 划转账户归一化：支持单个字符串或列表
+    # ================================================================
+    if isinstance(designated_account, str):
+        designated_accounts = {designated_account}
+    else:
+        designated_accounts = set(designated_account)
+
+    # ================================================================
+    # 3. 分类：来账 + 划转出账日期集合
     # ================================================================
     df = df.sort_values('日期对象').reset_index(drop=True)
 
-    # 收集所有向指定账户划转的出账日期
+    # 收集所有向任一指定账户划转的出账日期
     transfer_dates = set()
     for _, row in df.iterrows():
         amount = row['交易金额']
         if pd.isna(amount) or amount >= 0:
             continue
         counterparty = str(row.get('对方户名', '')).strip()
-        if counterparty == designated_account:
+        if counterparty in designated_accounts:
             transfer_dates.add(row['日期对象'])
 
     # ================================================================
-    # 3. 逐条来账检查：对方户名 != 指定账户 且 窗口内无划转 → 可疑
+    # 4. 逐条来账检查：对方户名不在指定账户中 且 窗口内无划转 → 可疑
     # ================================================================
     results = []
 
@@ -1654,8 +1663,8 @@ def detect_settlement_verification(
         credit_date = row['日期对象']
         counterparty = str(row.get('对方户名', '')).strip()
 
-        # 排除对方户名为指定账户的来账（内部调拨/退款，无需核查）
-        if counterparty == designated_account:
+        # 排除对方户名为任一指定账户的来账（内部调拨/退款，无需核查）
+        if counterparty in designated_accounts:
             continue
 
         # 计算检查窗口结束日：credit_date 往后加 days_threshold 个工作日（含当天）
