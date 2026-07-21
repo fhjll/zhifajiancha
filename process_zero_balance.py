@@ -1675,18 +1675,19 @@ def detect_settlement_verification(
                 m = re.search(r'共\s*(\d+)\s*笔', remarks)
                 batch_n = int(m.group(1)) if m else None
 
-                if batch_n is not None:
-                    # 有附言 N → 精确匹配：前 N 笔合计必须等于转出金额
-                    if len(pending) >= batch_n:
-                        batch_items = pending[:batch_n]
-                        batch_sum = sum(it['remaining'] for it in batch_items)
-                        if abs(batch_sum - debit_amt) < 0.005:
-                            for it in batch_items:
-                                match_results[it['credit_idx']] = it['remaining']
-                            del pending[:batch_n]
-                    # 不匹配则不做任何消耗（转出记录不匹配这批来账）
-                else:
-                    # 无附言 → 自由 FIFO 消耗
+                exact_matched = False
+                if batch_n is not None and len(pending) >= batch_n:
+                    # 优先级高：前 N 笔合计 = 转出金额 → 精确匹配 N 笔
+                    batch_items = pending[:batch_n]
+                    batch_sum = sum(it['remaining'] for it in batch_items)
+                    if abs(batch_sum - debit_amt) < 0.005:
+                        for it in batch_items:
+                            match_results[it['credit_idx']] = it['remaining']
+                        del pending[:batch_n]
+                        exact_matched = True
+
+                if not exact_matched:
+                    # 优先级低：自由 FIFO（无附言，或精确匹配失败回退）
                     while debit_amt > 0.005 and pending:
                         oldest = pending[0]
                         window_end = add_working_days(credits[oldest['credit_idx']]['date'], days_threshold)
