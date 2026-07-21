@@ -30,38 +30,8 @@ jobs:
           pip install pyinstaller
           pip install -r requirements.txt
 
-      - name: Build EXE
-        run: |
-          pyinstaller --onefile --windowed --name "执法检测系统" `
-            --add-data "事实认定书模板.docx;." `
-            --add-data "使用说明.md;." `
-            --add-data "column_mapping.json;." `
-            --hidden-import pandas `
-            --hidden-import openpyxl `
-            --hidden-import docx `
-            --hidden-import lxml `
-            --hidden-import customtkinter `
-            --hidden-import openai `
-            --hidden-import httpx `
-            --hidden-import httpcore `
-            --hidden-import sniffio `
-            --hidden-import PIL `
-            --hidden-import numpy `
-            --hidden-import preprocess `
-            --hidden-import generate_report `
-            --hidden-import process_zero_balance `
-            --hidden-import logger `
-            --hidden-import tkinter `
-            --hidden-import xml.etree.ElementTree `
-            --exclude-module matplotlib `
-            --exclude-module scipy `
-            --exclude-module PyQt5 `
-            --exclude-module notebook `
-            --exclude-module IPython `
-            --exclude-module jupyter `
-            --exclude-module bokeh `
-            --exclude-module plotly `
-            gui.py
+      - name: Build EXE (via spec)
+        run: pyinstaller 执法检测系统_Win_x64.spec
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
