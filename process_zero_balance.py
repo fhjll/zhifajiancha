@@ -1578,6 +1578,7 @@ def detect_settlement_verification(
         仅包含可疑记录，按来源日期降序排列。
         若无可疑记录则返回空 DataFrame。
     """
+    import re
     # ================================================================
     # 1. 加载数据
     # ================================================================
@@ -1670,16 +1671,27 @@ def detect_settlement_verification(
             # ── 出账 → 若对方为指定账户，从 FIFO 队头开始消耗 ──
             if counterparty in designated_accounts:
                 debit_amt = round(abs(amount), 2)
+                # 从附言提取批次数，如"财政授权支付退款共5笔数据" → 5
+                batch_limit = None
+                remarks = str(row.get('附言', '') or row.get('摘要', '') or '')
+                m = re.search(r'共\s*(\d+)\s*笔', remarks)
+                if m:
+                    batch_limit = int(m.group(1))
+
+                matched_count = 0
                 while debit_amt > 0.005 and pending:
+                    if batch_limit is not None and matched_count >= batch_limit:
+                        break  # 已达批次上限
                     oldest = pending[0]
                     window_end = add_working_days(credits[oldest['credit_idx']]['date'], days_threshold)
                     if date > window_end:
-                        pending.pop(0)  # 超窗口，放弃匹配
+                        pending.pop(0)
                         continue
                     match_amt = min(debit_amt, oldest['remaining'])
                     match_results[oldest['credit_idx']] += match_amt
                     oldest['remaining'] -= match_amt
                     debit_amt -= match_amt
+                    matched_count += 1
                     if oldest['remaining'] < 0.005:
                         pending.pop(0)
 
