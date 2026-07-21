@@ -1551,13 +1551,14 @@ def detect_settlement_verification(
     days_threshold: int = 2,
 ) -> pd.DataFrame:
     """
-    清算核查：对单个流水文件，检查来账后指定工作日内是否有划转到指定账户的出账。
+    清算核查：对单个流水文件，检查来账后指定工作日内是否有同金额划转到指定账户的出账。
 
     校验逻辑：
     1. 筛选所有来账（收入/贷，金额>0），排除对方户名为指定账户的记录（内部调拨）
     2. 对于每条来账，检查其日期后的 days_threshold 个工作日内（含当天），
-       是否存在至少一笔出账（借，金额<0）且交易对象为任一指定账户
-    3. 若不存在 → 标记为可疑
+       是否存在至少一笔同金额出账（借，金额<0）且交易对象为任一指定账户
+    3. 出账采用一配一规则（已匹配的出账不再复用）
+    4. 若不存在 → 标记为可疑
 
     注意：此检查不涉及金额匹配，仅判断是否有向指定账户的划转行为。
 
@@ -1636,22 +1637,27 @@ def detect_settlement_verification(
         designated_accounts = set(designated_account)
 
     # ================================================================
-    # 3. 分类：来账 + 划转出账日期集合
+    # 3. 分类：来账 + 划转出账金额集合（按日期分组，支持金额匹配）
     # ================================================================
     df = df.sort_values('日期对象').reset_index(drop=True)
 
-    # 收集所有向任一指定账户划转的出账日期
-    transfer_dates = set()
+    # 收集所有向任一指定账户划转的出账：(日期, 金额) → 待匹配列表
+    transfers = []  # [{date, amount, used}]
     for _, row in df.iterrows():
         amount = row['交易金额']
         if pd.isna(amount) or amount >= 0:
             continue
         counterparty = str(row.get('对方户名', '')).strip()
         if counterparty in designated_accounts:
-            transfer_dates.add(row['日期对象'])
+            transfers.append({
+                'date': row['日期对象'],
+                'amount': round(abs(amount), 2),
+                'used': False,
+                'counterparty': counterparty,
+            })
 
     # ================================================================
-    # 4. 逐条来账检查：对方户名不在指定账户中 且 窗口内无划转 → 可疑
+    # 4. 逐条来账检查：对方户名不在指定账户中 且 窗口内无同金额划转 → 可疑
     # ================================================================
     results = []
 
@@ -1661,6 +1667,7 @@ def detect_settlement_verification(
             continue
 
         credit_date = row['日期对象']
+        credit_amt = round(amount, 2)
         counterparty = str(row.get('对方户名', '')).strip()
 
         # 排除对方户名为任一指定账户的来账（内部调拨/退款，无需核查）
@@ -1670,13 +1677,19 @@ def detect_settlement_verification(
         # 计算检查窗口结束日：credit_date 往后加 days_threshold 个工作日（含当天）
         window_end = add_working_days(credit_date, days_threshold)
 
-        # 检查窗口内是否有划转到指定账户的出账
-        has_transfer = any(
-            d for d in transfer_dates
-            if credit_date <= d <= window_end
-        )
+        # 窗口内查找匹配金额的未使用划转（金额匹配，精确到0.01）
+        matched = False
+        for t in transfers:
+            if t['used']:
+                continue
+            if not (credit_date <= t['date'] <= window_end):
+                continue
+            if abs(t['amount'] - credit_amt) < 0.005:
+                t['used'] = True
+                matched = True
+                break
 
-        if not has_transfer:
+        if not matched:
             # 提取对方账号
             cpty_acct = ''
             for c in ('对方账号', '对方帐号'):
@@ -1685,7 +1698,6 @@ def detect_settlement_verification(
                     cpty_acct = f'{int(float(v))}' if isinstance(v, (int, float)) else str(v).strip()
                     break
 
-            credit_amt = round(amount, 2)
             results.append({
                 '文件来源': file_label,
                 '账号': account_num,
