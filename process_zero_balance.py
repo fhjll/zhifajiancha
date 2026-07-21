@@ -1637,79 +1637,84 @@ def detect_settlement_verification(
         designated_accounts = set(designated_account)
 
     # ================================================================
-    # 3. 分类：来账 + 划转出账金额集合（按日期分组，支持金额匹配）
+    # 3. FIFO 累计匹配：多笔来账可被一笔划转合并（多对一）
     # ================================================================
     df = df.sort_values('日期对象').reset_index(drop=True)
 
-    # 收集所有向任一指定账户划转的出账：(日期, 金额) → 待匹配列表
-    transfers = []  # [{date, amount, used}]
+    credits = []           # [{date, amount, counterparty, summary, row}]
+    pending = []           # FIFO 队列: [{credit_idx, remaining}]
+    match_results = {}     # credit_idx → matched_amount
+
     for _, row in df.iterrows():
         amount = row['交易金额']
-        if pd.isna(amount) or amount >= 0:
+        if pd.isna(amount) or amount == 0:
             continue
+        date = row['日期对象']
         counterparty = str(row.get('对方户名', '')).strip()
-        if counterparty in designated_accounts:
-            transfers.append({
-                'date': row['日期对象'],
-                'amount': round(abs(amount), 2),
-                'used': False,
+
+        if amount > 0:
+            # ── 来账 → 排除指定账户来的，其余入 FIFO ──
+            if counterparty in designated_accounts:
+                continue
+            ci = len(credits)
+            credits.append({
+                'date': date, 'amount': round(amount, 2),
                 'counterparty': counterparty,
+                'summary': str(row.get('摘要', '') or ''),
+                'row': row,
             })
+            pending.append({'credit_idx': ci, 'remaining': round(amount, 2)})
+            match_results[ci] = 0.0
+
+        elif amount < 0:
+            # ── 出账 → 若对方为指定账户，从 FIFO 队头开始消耗 ──
+            if counterparty in designated_accounts:
+                debit_amt = round(abs(amount), 2)
+                while debit_amt > 0.005 and pending:
+                    oldest = pending[0]
+                    window_end = add_working_days(credits[oldest['credit_idx']]['date'], days_threshold)
+                    if date > window_end:
+                        pending.pop(0)  # 超窗口，放弃匹配
+                        continue
+                    match_amt = min(debit_amt, oldest['remaining'])
+                    match_results[oldest['credit_idx']] += match_amt
+                    oldest['remaining'] -= match_amt
+                    debit_amt -= match_amt
+                    if oldest['remaining'] < 0.005:
+                        pending.pop(0)
 
     # ================================================================
-    # 4. 逐条来账检查：对方户名不在指定账户中 且 窗口内无同金额划转 → 可疑
+    # 4. 生成结果：未完全匹配的来账 → 可疑
     # ================================================================
     results = []
 
-    for _, row in df.iterrows():
-        amount = row['交易金额']
-        if pd.isna(amount) or amount <= 0:
-            continue
+    for ci, credit in enumerate(credits):
+        matched = match_results.get(ci, 0.0)
+        if matched >= credit['amount'] - 0.005:
+            continue  # 完全匹配
 
-        credit_date = row['日期对象']
-        credit_amt = round(amount, 2)
-        counterparty = str(row.get('对方户名', '')).strip()
+        row = credit['row']
+        window_end = add_working_days(credit['date'], days_threshold)
 
-        # 排除对方户名为任一指定账户的来账（内部调拨/退款，无需核查）
-        if counterparty in designated_accounts:
-            continue
-
-        # 计算检查窗口结束日：credit_date 往后加 days_threshold 个工作日（含当天）
-        window_end = add_working_days(credit_date, days_threshold)
-
-        # 窗口内查找匹配金额的未使用划转（金额匹配，精确到0.01）
-        matched = False
-        for t in transfers:
-            if t['used']:
-                continue
-            if not (credit_date <= t['date'] <= window_end):
-                continue
-            if abs(t['amount'] - credit_amt) < 0.005:
-                t['used'] = True
-                matched = True
+        cpty_acct = ''
+        for c in ('对方账号', '对方帐号'):
+            v = row.get(c)
+            if pd.notna(v):
+                cpty_acct = f'{int(float(v))}' if isinstance(v, (int, float)) else str(v).strip()
                 break
 
-        if not matched:
-            # 提取对方账号
-            cpty_acct = ''
-            for c in ('对方账号', '对方帐号'):
-                v = row.get(c)
-                if pd.notna(v):
-                    cpty_acct = f'{int(float(v))}' if isinstance(v, (int, float)) else str(v).strip()
-                    break
-
-            results.append({
-                '文件来源': file_label,
-                '账号': account_num,
-                '来源日期': credit_date.strftime('%Y-%m-%d'),
-                '来源金额': credit_amt,
-                '摘要': str(row.get('摘要', '') or ''),
-                '对方账号': cpty_acct,
-                '来账对方户名': counterparty,
-                '窗口截止': window_end.strftime('%Y-%m-%d'),
-                '窗口工作日': days_threshold,
-                '状态': '可疑',
-            })
+        results.append({
+            '文件来源': file_label,
+            '账号': account_num,
+            '来源日期': credit['date'].strftime('%Y-%m-%d'),
+            '来源金额': credit['amount'],
+            '摘要': credit['summary'],
+            '对方账号': cpty_acct,
+            '来账对方户名': credit['counterparty'],
+            '窗口截止': window_end.strftime('%Y-%m-%d'),
+            '窗口工作日': days_threshold,
+            '状态': '可疑',
+        })
 
     results_df = pd.DataFrame(results)
     if len(results_df) > 0:
