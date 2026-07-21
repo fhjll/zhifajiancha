@@ -7,6 +7,7 @@ __pycache__/
 *.pyo
 *.exe
 *.spec
+!执法检测系统_Win_x64.spec
 .DS_Store
 Thumbs.db
 .claude/
