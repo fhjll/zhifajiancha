@@ -1668,32 +1668,37 @@ def detect_settlement_verification(
             match_results[ci] = 0.0
 
         elif amount < 0:
-            # ── 出账 → 若对方为指定账户，从 FIFO 队头开始消耗 ──
+            # ── 出账 → 若对方为指定账户，FIFO 消耗 ──
             if counterparty in designated_accounts:
                 debit_amt = round(abs(amount), 2)
-                # 从附言提取批次数，如"财政授权支付退款共5笔数据" → 5
-                batch_limit = None
                 remarks = str(row.get('附言', '') or row.get('摘要', '') or '')
                 m = re.search(r'共\s*(\d+)\s*笔', remarks)
-                if m:
-                    batch_limit = int(m.group(1))
+                batch_n = int(m.group(1)) if m else None
 
-                matched_count = 0
-                while debit_amt > 0.005 and pending:
-                    if batch_limit is not None and matched_count >= batch_limit:
-                        break  # 已达批次上限
-                    oldest = pending[0]
-                    window_end = add_working_days(credits[oldest['credit_idx']]['date'], days_threshold)
-                    if date > window_end:
-                        pending.pop(0)
-                        continue
-                    match_amt = min(debit_amt, oldest['remaining'])
-                    match_results[oldest['credit_idx']] += match_amt
-                    oldest['remaining'] -= match_amt
-                    debit_amt -= match_amt
-                    matched_count += 1
-                    if oldest['remaining'] < 0.005:
-                        pending.pop(0)
+                if batch_n is not None:
+                    # 有附言 N → 精确匹配：前 N 笔合计必须等于转出金额
+                    if len(pending) >= batch_n:
+                        batch_items = pending[:batch_n]
+                        batch_sum = sum(it['remaining'] for it in batch_items)
+                        if abs(batch_sum - debit_amt) < 0.005:
+                            for it in batch_items:
+                                match_results[it['credit_idx']] = it['remaining']
+                            del pending[:batch_n]
+                    # 不匹配则不做任何消耗（转出记录不匹配这批来账）
+                else:
+                    # 无附言 → 自由 FIFO 消耗
+                    while debit_amt > 0.005 and pending:
+                        oldest = pending[0]
+                        window_end = add_working_days(credits[oldest['credit_idx']]['date'], days_threshold)
+                        if date > window_end:
+                            pending.pop(0)
+                            continue
+                        match_amt = min(debit_amt, oldest['remaining'])
+                        match_results[oldest['credit_idx']] += match_amt
+                        oldest['remaining'] -= match_amt
+                        debit_amt -= match_amt
+                        if oldest['remaining'] < 0.005:
+                            pending.pop(0)
 
     # ================================================================
     # 4. 生成结果：未完全匹配的来账 → 可疑
