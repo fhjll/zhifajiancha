@@ -1581,46 +1581,7 @@ def detect_settlement_verification(
         若无可疑记录则返回空 DataFrame。
     """
     import re
-
-    def _combine_date_time(date_obj, time_val):
-        """将日期对象与时间值合并为精确到秒的 datetime。"""
-        if date_obj is None:
-            return None
-        # datetime.time / datetime 对象直接取时分秒
-        if hasattr(time_val, 'hour') and hasattr(time_val, 'minute'):
-            return date_obj.replace(
-                hour=time_val.hour,
-                minute=time_val.minute,
-                second=getattr(time_val, 'second', 0),
-            )
-        if isinstance(time_val, (int, float)) and not pd.isna(time_val):
-            # Excel 时间可能以分数形式存储（0.5 表示 12:00）
-            if 0 <= float(time_val) < 1:
-                frac = float(time_val)
-                hours = int(frac * 24)
-                minutes = int((frac * 24 - hours) * 60)
-                seconds = int(round((((frac * 24 - hours) * 60) - minutes) * 60))
-                return date_obj.replace(hour=hours, minute=minutes, second=seconds)
-            # HHMMSS 整数形式，如 93000 表示 09:30:00
-            s = str(int(time_val))
-            if len(s) == 6:
-                try:
-                    return date_obj.replace(
-                        hour=int(s[:2]), minute=int(s[2:4]), second=int(s[4:6])
-                    )
-                except ValueError:
-                    pass
-        if isinstance(time_val, str) and time_val.strip():
-            t_str = time_val.strip().replace('：', ':').replace('.', ':')
-            for fmt in ('%H:%M:%S', '%H:%M', '%H%M%S', '%H%M'):
-                try:
-                    t_obj = datetime.strptime(t_str, fmt)
-                    return date_obj.replace(
-                        hour=t_obj.hour, minute=t_obj.minute, second=t_obj.second
-                    )
-                except ValueError:
-                    continue
-        return date_obj
+    import bisect
 
     # ================================================================
     # 1. 加载数据
@@ -1676,16 +1637,44 @@ def detect_settlement_verification(
     if len(df) == 0:
         return pd.DataFrame()
 
-    # 合并日期与时间，生成精确到秒的时间对象
+    # 合并日期与时间，生成精确到秒的时间对象（向量化）
     time_col = None
     for c in ['入帐时间', '交易时间', '入账时间', '时间']:
         if c in df.columns:
             time_col = c
             break
     if time_col:
-        df['时间对象'] = df.apply(
-            lambda r: _combine_date_time(r['日期对象'], r.get(time_col)), axis=1
+        time_str = (
+            df[time_col].astype(str)
+            .str.strip()
+            .str.replace('.', ':', regex=False)
+            .str.replace('：', ':', regex=False)
         )
+        time_parsed = pd.to_datetime(time_str, format='%H:%M:%S', errors='coerce')
+        mask = time_parsed.isna()
+        for fmt in ('%H:%M', '%H%M%S', '%H%M'):
+            if not mask.any():
+                break
+            time_parsed.loc[mask] = pd.to_datetime(time_str[mask], format=fmt, errors='coerce')
+            mask = time_parsed.isna()
+
+        seconds = (
+            time_parsed.dt.hour.fillna(0) * 3600
+            + time_parsed.dt.minute.fillna(0) * 60
+            + time_parsed.dt.second.fillna(0)
+        )
+        df['时间对象'] = df['日期对象'] + pd.to_timedelta(seconds, unit='s')
+
+        # 处理 Excel 分数时间（数值型且未被字符串解析覆盖）
+        numeric_mask = time_parsed.isna() & pd.api.types.is_numeric_dtype(df[time_col])
+        if numeric_mask.any():
+            frac = pd.to_numeric(df.loc[numeric_mask, time_col], errors='coerce')
+            valid = frac.between(0, 1)
+            if valid.any():
+                idx = frac[valid].index
+                df.loc[idx, '时间对象'] = df.loc[idx, '日期对象'] + pd.to_timedelta(
+                    (frac[valid] * 86400).round(), unit='s'
+                )
     else:
         df['时间对象'] = df['日期对象']
 
@@ -1724,28 +1713,54 @@ def detect_settlement_verification(
     # ================================================================
     df = df.sort_values('时间对象').reset_index(drop=True)
 
-    credits = []      # 所有待查资金记录
-    pending = []      # 未退回的待查资金索引队列，按 deadline 顺序
-    matched = set()   # 已退回的待查资金索引
-    expired = set()   # 超期未退回的待查资金索引
+    # 提取列为 NumPy 数组遍历，避免 to_dict/iterrows 的开销
+    amounts = df['交易金额'].values
+    dates = df['日期对象'].values
+    dts = df['时间对象'].values
+    counterparties = (
+        df['对方户名'].fillna('').astype(str).str.strip().values
+        if '对方户名' in df.columns else [''] * len(df)
+    )
+    summaries = (
+        df['摘要'].fillna('').astype(str).str.strip().values
+        if '摘要' in df.columns else [''] * len(df)
+    )
+    remarks_col = (
+        df['附言'].fillna('').astype(str).str.strip().values
+        if '附言' in df.columns else [''] * len(df)
+    )
+    acct_col = None
+    for c in ('对方账号', '对方帐号'):
+        if c in df.columns:
+            acct_col = c
+            break
+    accts = df[acct_col].values if acct_col else [None] * len(df)
+
+    credits = []           # 所有待查资金记录
+    pending = []           # 待查资金索引（按时间顺序）
+    pending_times = []     # 对应时间戳
+    pending_deadlines = [] # 对应截止日期
+    active = []            # 是否未匹配
+    matched = set()        # 已退回的待查资金索引
+    expired = set()        # 超期未退回的待查资金索引
 
     def _expire_overdue(current_date):
         """将截止日早于 current_date 且未退回的待查资金标记为违规。
 
-        只把超期记录放入 expired 集合，不从待查池 pending 中移除，
-        后续匹配资金仍可匹配这些超期资金。
+        只把超期记录放入 expired 集合，不移出待查池。
+        利用 pending_deadlines 有序性二分查找定位。
         """
-        for ci in pending:
-            if credits[ci]['deadline'] < current_date:
-                expired.add(ci)
-            else:
-                break
+        idx = bisect.bisect_left(pending_deadlines, current_date)
+        for i in range(idx):
+            if active[i]:
+                expired.add(pending[i])
 
     def _find_refund_subset(eligible_items, count, target_amount):
         """
         从 eligible_items 中找出 count 笔，使其金额之和等于 target_amount。
-        eligible_items 为按时间顺序排列的待查资金列表。
         返回在 eligible_items 中的索引列表，找不到返回 None。
+
+        为避免组合爆炸，规模较大时直接按时间顺序取前 count 笔。
         """
         n = len(eligible_items)
         if count > n:
@@ -1765,20 +1780,31 @@ def detect_settlement_verification(
         if abs(first_total - target_amount) < 0.005:
             return list(range(count))
 
-        # 回溯寻找组合（笔数通常较小，回溯可接受）
+        # 规模太大时避免回溯爆炸，直接按时间顺序取前 count 笔
+        if n > 50 or count > 10:
+            return list(range(count))
+
+        # 小规模时用回溯精确匹配
+        amounts_fen = [round(item['amount'] * 100) for item in eligible_items]
+        target_fen = round(target_amount * 100)
+
+        suffix_sum = [0] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            suffix_sum[i] = suffix_sum[i + 1] + amounts_fen[i]
+
         def backtrack(start, remaining_count, current_sum, path):
             if remaining_count == 0:
-                if abs(current_sum - target_amount) < 0.005:
-                    return path[:]
+                return path[:] if current_sum == target_fen else None
+            if start >= n or n - start < remaining_count:
                 return None
-            if start >= n:
+            if current_sum > target_fen:
                 return None
-            if n - start < remaining_count:
+            if current_sum + suffix_sum[start] < target_fen:
                 return None
             for i in range(start, n):
                 r = backtrack(
                     i + 1, remaining_count - 1,
-                    current_sum + eligible_items[i]['amount'],
+                    current_sum + amounts_fen[i],
                     path + [i],
                 )
                 if r is not None:
@@ -1787,15 +1813,15 @@ def detect_settlement_verification(
 
         return backtrack(0, count, 0, [])
 
-    for _, row in df.iterrows():
-        amount = row['交易金额']
+    for i in range(len(df)):
+        amount = amounts[i]
         if pd.isna(amount) or amount == 0:
             continue
-        date = row['日期对象']
-        dt = row['时间对象']
-        counterparty = str(row.get('对方户名', '')).strip()
+        date = dates[i]
+        dt = dts[i]
+        counterparty = counterparties[i]
 
-        # 先处理已超期的待查资金（按日期判断，不移出待查池）
+        # 先处理已超期的待查资金（不移出待查池）
         _expire_overdue(date)
 
         if amount > 0:
@@ -1807,59 +1833,66 @@ def detect_settlement_verification(
             credits.append({
                 'date': date, 'datetime': dt, 'amount': round(amount, 2),
                 'counterparty': counterparty,
-                'summary': str(row.get('摘要', '') or ''),
-                'deadline': deadline, 'row': row,
+                'summary': summaries[i],
+                'deadline': deadline, 'row_idx': i,
+                'pending_idx': len(pending),
             })
             pending.append(ci)
+            pending_times.append(dt)
+            pending_deadlines.append(deadline)
+            active.append(True)
 
         elif amount < 0:
             # ── 匹配资金：汇往指定账户 → 尝试匹配待查资金 ──
             if counterparty not in designated_accounts:
                 continue
             debit_amt = round(abs(amount), 2)
-            remarks = str(row.get('附言', '') or row.get('摘要', '') or '')
-            # 解析退款笔数，支持 "退3笔"、"共3笔"、"3笔" 等
+
+            remarks = remarks_col[i] or summaries[i]
             m = re.search(r'(?:退|共)?\s*(\d+)\s*笔', remarks)
             batch_n = int(m.group(1)) if m else None
 
-            # 匹配资金时间点之前的待查资金（严格早于当前交易时间）
-            eligible = [ci for ci in pending if credits[ci]['datetime'] < dt]
+            # 二分查找定位匹配资金时间点之前的待查资金
+            idx_end = bisect.bisect_left(pending_times, dt)
+            eligible = [pending[j] for j in range(idx_end) if active[j]]
 
             if batch_n is not None and eligible:
                 if batch_n >= len(eligible):
                     # 附言笔数 >= 剩余笔数，认为全部退回
                     for ci in eligible:
                         matched.add(ci)
-                        pending.remove(ci)
+                        active[credits[ci]['pending_idx']] = False
                 else:
                     # 附言笔数 < 剩余笔数，按金额匹配找出具体 N 笔
+                    print(
+                        f"[清算核查] 条数({len(eligible)}) > 笔数({batch_n})，需金额匹配: "
+                        f"{date.strftime('%Y-%m-%d')} {dt.strftime('%H:%M:%S')} "
+                        f"金额:{debit_amt}"
+                    )
                     eligible_items = [credits[ci] for ci in eligible]
                     subset = _find_refund_subset(eligible_items, batch_n, debit_amt)
                     if subset is not None:
                         for idx in subset:
                             ci = eligible[idx]
                             matched.add(ci)
-                            pending.remove(ci)
+                            active[credits[ci]['pending_idx']] = False
                     else:
                         # 金额匹配失败时，按时间顺序默认退前 N 笔
-                        for i in range(batch_n):
-                            ci = eligible[i]
+                        for k in range(batch_n):
+                            ci = eligible[k]
                             matched.add(ci)
-                            pending.remove(ci)
+                            active[credits[ci]['pending_idx']] = False
             elif eligible:
                 # 无附言笔数，回退到自由 FIFO 金额匹配
                 remaining_debit = debit_amt
-                removed = []
                 for ci in eligible:
                     if remaining_debit < 0.005:
                         break
                     avail = credits[ci]['amount']
                     if avail <= remaining_debit + 0.005:
                         matched.add(ci)
-                        removed.append(ci)
+                        active[credits[ci]['pending_idx']] = False
                         remaining_debit -= avail
-                for ci in removed:
-                    pending.remove(ci)
 
     # 数据遍历结束后，以最后日期为界再检查一次超期待查资金
     if len(df) > 0:
@@ -1873,15 +1906,14 @@ def detect_settlement_verification(
 
     for ci in expired:
         credit = credits[ci]
-        row = credit['row']
+        row_idx = credit['row_idx']
         deadline_str = credit['deadline'].strftime('%Y-%m-%d')
 
         cpty_acct = ''
-        for c in ('对方账号', '对方帐号'):
-            v = row.get(c)
+        if acct_col:
+            v = accts[row_idx]
             if pd.notna(v):
                 cpty_acct = f'{int(float(v))}' if isinstance(v, (int, float)) else str(v).strip()
-                break
 
         results.append({
             '文件来源': file_label,
