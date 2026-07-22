@@ -379,7 +379,7 @@ def main():
     # 解析逗号分隔的多账户
     settlement_account_list = None
     if args.settlement_account:
-        parts = [a.strip() for a in args.settlement_account.split(',') if a.strip()]
+        parts = [a.strip() for a in args.settlement_account.replace('，', ',').split(',') if a.strip()]
         settlement_account_list = parts if len(parts) > 1 else args.settlement_account
 
     run_pipeline(
