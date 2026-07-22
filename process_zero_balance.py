@@ -1872,7 +1872,7 @@ def detect_settlement_verification(
                     # 附言笔数 < 剩余笔数，按金额匹配找出具体 N 笔
                     print(
                         f"[清算核查] 条数({len(eligible)}) > 笔数({batch_n})，需金额匹配: "
-                        f"{py_date.strftime('%Y-%m-%d')} {dt.strftime('%H:%M:%S')} "
+                        f"{py_date.strftime('%Y-%m-%d')} {pd.Timestamp(dt).strftime('%H:%M:%S')} "
                         f"金额:{debit_amt}"
                     )
                     eligible_items = [credits[ci] for ci in eligible]
