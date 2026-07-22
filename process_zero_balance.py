@@ -1558,10 +1558,11 @@ def detect_settlement_verification(
     2. 匹配资金：所有汇往指定账户的出账（金额<0）。
     3. 遍历交易，对每笔匹配资金：
        - 从附言/摘要中解析退款笔数 N。
-       - 找出匹配资金交易日期之前的待查资金中尚未退回的款项。
+       - 结合入帐日期与入帐时间，找出匹配资金发生时间点之前的待查资金。
        - 若 N >= 剩余笔数：认为这些待查资金全部退回，从待查记录中删除。
        - 若 N < 剩余笔数：按金额匹配确定具体哪 N 笔被退回，退回的从待查记录中删除。
-    4. 每笔待查资金超过 days_threshold 个工作日仍未退回的，记为违规资金。
+    4. 每笔待查资金超过 days_threshold 个工作日仍未退回的，记入超期集合；
+       超期记录不从待查池移除，后续匹配资金仍可匹配，最终仅输出超期集合中的信息。
 
     参数
     ----------
@@ -1580,6 +1581,47 @@ def detect_settlement_verification(
         若无可疑记录则返回空 DataFrame。
     """
     import re
+
+    def _combine_date_time(date_obj, time_val):
+        """将日期对象与时间值合并为精确到秒的 datetime。"""
+        if date_obj is None:
+            return None
+        # datetime.time / datetime 对象直接取时分秒
+        if hasattr(time_val, 'hour') and hasattr(time_val, 'minute'):
+            return date_obj.replace(
+                hour=time_val.hour,
+                minute=time_val.minute,
+                second=getattr(time_val, 'second', 0),
+            )
+        if isinstance(time_val, (int, float)) and not pd.isna(time_val):
+            # Excel 时间可能以分数形式存储（0.5 表示 12:00）
+            if 0 <= float(time_val) < 1:
+                frac = float(time_val)
+                hours = int(frac * 24)
+                minutes = int((frac * 24 - hours) * 60)
+                seconds = int(round((((frac * 24 - hours) * 60) - minutes) * 60))
+                return date_obj.replace(hour=hours, minute=minutes, second=seconds)
+            # HHMMSS 整数形式，如 93000 表示 09:30:00
+            s = str(int(time_val))
+            if len(s) == 6:
+                try:
+                    return date_obj.replace(
+                        hour=int(s[:2]), minute=int(s[2:4]), second=int(s[4:6])
+                    )
+                except ValueError:
+                    pass
+        if isinstance(time_val, str) and time_val.strip():
+            t_str = time_val.strip().replace('：', ':').replace('.', ':')
+            for fmt in ('%H:%M:%S', '%H:%M', '%H%M%S', '%H%M'):
+                try:
+                    t_obj = datetime.strptime(t_str, fmt)
+                    return date_obj.replace(
+                        hour=t_obj.hour, minute=t_obj.minute, second=t_obj.second
+                    )
+                except ValueError:
+                    continue
+        return date_obj
+
     # ================================================================
     # 1. 加载数据
     # ================================================================
@@ -1634,6 +1676,19 @@ def detect_settlement_verification(
     if len(df) == 0:
         return pd.DataFrame()
 
+    # 合并日期与时间，生成精确到秒的时间对象
+    time_col = None
+    for c in ['入帐时间', '交易时间', '入账时间', '时间']:
+        if c in df.columns:
+            time_col = c
+            break
+    if time_col:
+        df['时间对象'] = df.apply(
+            lambda r: _combine_date_time(r['日期对象'], r.get(time_col)), axis=1
+        )
+    else:
+        df['时间对象'] = df['日期对象']
+
     # 提取数据来源标识
     file_label = os.path.splitext(os.path.basename(file_path))[0]
     account_num = ''
@@ -1660,12 +1715,14 @@ def detect_settlement_verification(
     #    - 待查资金 = 非指定账户汇入
     #    - 匹配资金 = 汇往指定账户的出账
     #    - 在匹配资金发生前，先检查是否有待查资金已超截止日（deadline < 当前日期）
+    #      超期记录只标记不移出，仍可被后续匹配资金匹配
+    #    - 结合日期+时间戳筛选：仅匹配资金发生时间点之前收到的待查资金
     #    - 根据附言中的退款笔数 N：
-    #      N >= 日期前剩余待查笔数 → 全部退回
-    #      N < 日期前剩余待查笔数 → 金额匹配确定具体 N 笔
+    #      N >= 剩余待查笔数 → 全部退回
+    #      N < 剩余待查笔数 → 金额匹配确定具体 N 笔
     #    - 无附言笔数时回退到自由 FIFO 金额匹配
     # ================================================================
-    df = df.sort_values('日期对象').reset_index(drop=True)
+    df = df.sort_values('时间对象').reset_index(drop=True)
 
     credits = []      # 所有待查资金记录
     pending = []      # 未退回的待查资金索引队列，按 deadline 顺序
@@ -1673,11 +1730,14 @@ def detect_settlement_verification(
     expired = set()   # 超期未退回的待查资金索引
 
     def _expire_overdue(current_date):
-        """将截止日早于 current_date 且未退回的待查资金标记为违规并移除。"""
-        for ci in list(pending):
+        """将截止日早于 current_date 且未退回的待查资金标记为违规。
+
+        只把超期记录放入 expired 集合，不从待查池 pending 中移除，
+        后续匹配资金仍可匹配这些超期资金。
+        """
+        for ci in pending:
             if credits[ci]['deadline'] < current_date:
                 expired.add(ci)
-                pending.remove(ci)
             else:
                 break
 
@@ -1732,9 +1792,10 @@ def detect_settlement_verification(
         if pd.isna(amount) or amount == 0:
             continue
         date = row['日期对象']
+        dt = row['时间对象']
         counterparty = str(row.get('对方户名', '')).strip()
 
-        # 先处理已超期的待查资金
+        # 先处理已超期的待查资金（按日期判断，不移出待查池）
         _expire_overdue(date)
 
         if amount > 0:
@@ -1744,7 +1805,7 @@ def detect_settlement_verification(
             ci = len(credits)
             deadline = add_working_days(date, days_threshold)
             credits.append({
-                'date': date, 'amount': round(amount, 2),
+                'date': date, 'datetime': dt, 'amount': round(amount, 2),
                 'counterparty': counterparty,
                 'summary': str(row.get('摘要', '') or ''),
                 'deadline': deadline, 'row': row,
@@ -1761,8 +1822,8 @@ def detect_settlement_verification(
             m = re.search(r'(?:退|共)?\s*(\d+)\s*笔', remarks)
             batch_n = int(m.group(1)) if m else None
 
-            # 匹配资金日期之前的待查资金（严格早于当前日期）
-            eligible = [ci for ci in pending if credits[ci]['date'] < date]
+            # 匹配资金时间点之前的待查资金（严格早于当前交易时间）
+            eligible = [ci for ci in pending if credits[ci]['datetime'] < dt]
 
             if batch_n is not None and eligible:
                 if batch_n >= len(eligible):
