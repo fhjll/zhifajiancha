@@ -1607,9 +1607,26 @@ def detect_settlement_verification(
         if '摘要' not in df.columns:
             df['摘要'] = df.get('附言', '')
     else:
-        xls = pd.ExcelFile(file_path)
-        sheet_name = xls.sheet_names[0]
-        df = _load_zero_balance(xls, sheet_name)
+        _, df = _load_dataframe(file_path)
+        if len(df) == 0:
+            return pd.DataFrame()
+        df = _normalize_csv_columns(df, convert_fen=False)
+        date_col = None
+        for c in ['交易日期', '入帐日期', '入账日期']:
+            if c in df.columns:
+                date_col = c
+                break
+        if date_col:
+            df = df.dropna(subset=[date_col])
+            df['日期对象'] = df[date_col].apply(parse_date)
+            df = df.dropna(subset=['日期对象'])
+        if '交易金额' in df.columns:
+            df['交易金额'] = pd.to_numeric(df['交易金额'], errors='coerce')
+        elif '发生额' in df.columns:
+            df['交易金额'] = pd.to_numeric(df['发生额'], errors='coerce')
+        df = _normalize_amount_vectorized(df)
+        if '对方户名' not in df.columns or df['对方户名'].isna().all():
+            df['对方户名'] = df.get('对方行名', '')
         if '摘要' not in df.columns:
             df['摘要'] = ''
 
@@ -1741,6 +1758,9 @@ def detect_settlement_verification(
     results_df = pd.DataFrame(results)
     if len(results_df) > 0:
         results_df = results_df.sort_values('来源日期', ascending=False).reset_index(drop=True)
+
+    matched_count = sum(1 for ci in range(len(credits)) if match_results.get(ci, 0) >= credits[ci]['amount'] - 0.005)
+    print(f"[清算核查] 来账:{len(credits)} 已匹配:{matched_count} 可疑:{len(results_df)}")
 
     return results_df
 
