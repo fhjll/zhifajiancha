@@ -1542,7 +1542,7 @@ def detect_non_tax_verification(
 
 
 # =========================
-# 清算核查（简化版：仅输出可疑记录）
+# 清算核查简化版：仅输出可疑记录）
 # =========================
 
 def detect_settlement_verification(
@@ -1551,31 +1551,32 @@ def detect_settlement_verification(
     days_threshold: int = 2,
 ) -> pd.DataFrame:
     """
-    清算核查：对单个流水文件，检查来账后指定工作日内是否有同金额划转到指定账户的出账。
+    清算核查：按退款笔数核对待查资金与匹配资金。
 
     校验逻辑：
-    1. 筛选所有来账（收入/贷，金额>0），排除对方户名为指定账户的记录（内部调拨）
-    2. 对于每条来账，检查其日期后的 days_threshold 个工作日内（含当天），
-       是否存在至少一笔同金额出账（借，金额<0）且交易对象为任一指定账户
-    3. 出账采用一配一规则（已匹配的出账不再复用）
-    4. 若不存在 → 标记为可疑
-
-    注意：此检查不涉及金额匹配，仅判断是否有向指定账户的划转行为。
+    1. 待查资金：非指定账户汇入的款项（金额>0）。
+    2. 匹配资金：所有汇往指定账户的出账（金额<0）。
+    3. 遍历交易，对每笔匹配资金：
+       - 从附言/摘要中解析退款笔数 N。
+       - 找出匹配资金交易日期之前的待查资金中尚未退回的款项。
+       - 若 N >= 剩余笔数：认为这些待查资金全部退回，从待查记录中删除。
+       - 若 N < 剩余笔数：按金额匹配确定具体哪 N 笔被退回，退回的从待查记录中删除。
+    4. 每笔待查资金超过 days_threshold 个工作日仍未退回的，记为违规资金。
 
     参数
     ----------
     file_path : str
         流水文件路径（CSV 或 Excel）
     designated_account : str 或 list[str]
-        指定划转账户的对方户名，支持多个（如 ['待报解预算收入', '国库经收处']）；
+        指定划转账户的对方户名，支持多个；
         默认 "待报解预算收入"
     days_threshold : int
-        工作日阈值（默认 2）。来账后此工作日内无划转 → 标记"可疑"
+        工作日阈值（默认 2）。待查资金超过此工作日未退回 → 标记"违规"
 
     返回
     -------
     pd.DataFrame
-        仅包含可疑记录，按来源日期降序排列。
+        仅包含违规的待查资金记录，按来源日期降序排列。
         若无可疑记录则返回空 DataFrame。
     """
     import re
@@ -1658,14 +1659,73 @@ def detect_settlement_verification(
     # 3. 匹配逻辑：
     #    - 待查资金 = 非指定账户汇入
     #    - 匹配资金 = 汇往指定账户的出账
-    #    - 根据附言中"共N笔"：N==待查数 → 全匹配；N<待查数 → 金额匹配
-    #    - 超 deadline 未匹配 → 违规
+    #    - 在匹配资金发生前，先检查是否有待查资金已超截止日（deadline < 当前日期）
+    #    - 根据附言中的退款笔数 N：
+    #      N >= 日期前剩余待查笔数 → 全部退回
+    #      N < 日期前剩余待查笔数 → 金额匹配确定具体 N 笔
+    #    - 无附言笔数时回退到自由 FIFO 金额匹配
     # ================================================================
     df = df.sort_values('日期对象').reset_index(drop=True)
 
-    credits = []      # [{date, amount, counterparty, summary, row}]
-    pending = []      # [credit_idx] 按时间顺序
-    match_debit = {}  # credit_idx → matched_amount
+    credits = []      # 所有待查资金记录
+    pending = []      # 未退回的待查资金索引队列，按 deadline 顺序
+    matched = set()   # 已退回的待查资金索引
+    expired = set()   # 超期未退回的待查资金索引
+
+    def _expire_overdue(current_date):
+        """将截止日早于 current_date 且未退回的待查资金标记为违规并移除。"""
+        for ci in list(pending):
+            if credits[ci]['deadline'] < current_date:
+                expired.add(ci)
+                pending.remove(ci)
+            else:
+                break
+
+    def _find_refund_subset(eligible_items, count, target_amount):
+        """
+        从 eligible_items 中找出 count 笔，使其金额之和等于 target_amount。
+        eligible_items 为按时间顺序排列的待查资金列表。
+        返回在 eligible_items 中的索引列表，找不到返回 None。
+        """
+        n = len(eligible_items)
+        if count > n:
+            return None
+        if count == 0:
+            return [] if abs(target_amount) < 0.005 else None
+
+        # 全部匹配
+        if count == n:
+            total = sum(item['amount'] for item in eligible_items)
+            if abs(total - target_amount) < 0.005:
+                return list(range(n))
+            return None
+
+        # 优先尝试按时间顺序的前 count 笔
+        first_total = sum(eligible_items[i]['amount'] for i in range(count))
+        if abs(first_total - target_amount) < 0.005:
+            return list(range(count))
+
+        # 回溯寻找组合（笔数通常较小，回溯可接受）
+        def backtrack(start, remaining_count, current_sum, path):
+            if remaining_count == 0:
+                if abs(current_sum - target_amount) < 0.005:
+                    return path[:]
+                return None
+            if start >= n:
+                return None
+            if n - start < remaining_count:
+                return None
+            for i in range(start, n):
+                r = backtrack(
+                    i + 1, remaining_count - 1,
+                    current_sum + eligible_items[i]['amount'],
+                    path + [i],
+                )
+                if r is not None:
+                    return r
+            return None
+
+        return backtrack(0, count, 0, [])
 
     for _, row in df.iterrows():
         amount = row['交易金额']
@@ -1673,6 +1733,9 @@ def detect_settlement_verification(
             continue
         date = row['日期对象']
         counterparty = str(row.get('对方户名', '')).strip()
+
+        # 先处理已超期的待查资金
+        _expire_overdue(date)
 
         if amount > 0:
             # ── 待查资金：非指定账户汇入 → 入队 ──
@@ -1687,72 +1750,68 @@ def detect_settlement_verification(
                 'deadline': deadline, 'row': row,
             })
             pending.append(ci)
-            match_debit[ci] = 0.0
 
         elif amount < 0:
-            # ── 匹配资金 → 尝试匹配待查资金 ──
+            # ── 匹配资金：汇往指定账户 → 尝试匹配待查资金 ──
             if counterparty not in designated_accounts:
                 continue
             debit_amt = round(abs(amount), 2)
             remarks = str(row.get('附言', '') or row.get('摘要', '') or '')
-            m = re.search(r'共\s*(\d+)\s*笔', remarks)
+            # 解析退款笔数，支持 "退3笔"、"共3笔"、"3笔" 等
+            m = re.search(r'(?:退|共)?\s*(\d+)\s*笔', remarks)
             batch_n = int(m.group(1)) if m else None
 
-            # 当前在窗口内的待查资金（日期 ≤ 出账日期，且 deadline ≥ 出账日期）
-            window_pending = [ci for ci in pending
-                              if credits[ci]['date'] <= date and credits[ci]['deadline'] >= date]
+            # 匹配资金日期之前的待查资金（严格早于当前日期）
+            eligible = [ci for ci in pending if credits[ci]['date'] < date]
 
-            matched = False
-            if batch_n is not None and window_pending:
-                if batch_n >= len(window_pending):
-                    # N >= 待查数 → 全部匹配
-                    window_sum = sum(credits[ci]['amount'] - match_debit.get(ci, 0) for ci in window_pending)
-                    if abs(window_sum - debit_amt) < 0.005:
-                        for ci in window_pending:
-                            match_debit[ci] = credits[ci]['amount']
-                            if ci in pending:
-                                pending.remove(ci)
-                        matched = True
+            if batch_n is not None and eligible:
+                if batch_n >= len(eligible):
+                    # 附言笔数 >= 剩余笔数，认为全部退回
+                    for ci in eligible:
+                        matched.add(ci)
+                        pending.remove(ci)
                 else:
-                    # N < 待查数 → 从前 N 笔开始尝试 FIFO + 金额累计
-                    candidates = window_pending[:batch_n]
-                    cand_sum = sum(credits[ci]['amount'] - match_debit.get(ci, 0) for ci in candidates)
-                    if abs(cand_sum - debit_amt) < 0.005:
-                        for ci in candidates:
-                            match_debit[ci] = credits[ci]['amount']
-                            if ci in pending:
-                                pending.remove(ci)
-                        matched = True
-
-            # 无附言或匹配失败 → 回退到自由 FIFO
-            if not matched and pending:
+                    # 附言笔数 < 剩余笔数，按金额匹配找出具体 N 笔
+                    eligible_items = [credits[ci] for ci in eligible]
+                    subset = _find_refund_subset(eligible_items, batch_n, debit_amt)
+                    if subset is not None:
+                        for idx in subset:
+                            ci = eligible[idx]
+                            matched.add(ci)
+                            pending.remove(ci)
+                    else:
+                        # 金额匹配失败时，按时间顺序默认退前 N 笔
+                        for i in range(batch_n):
+                            ci = eligible[i]
+                            matched.add(ci)
+                            pending.remove(ci)
+            elif eligible:
+                # 无附言笔数，回退到自由 FIFO 金额匹配
                 remaining_debit = debit_amt
                 removed = []
-                for ci in list(pending):
+                for ci in eligible:
                     if remaining_debit < 0.005:
                         break
-                    if credits[ci]['date'] > date or credits[ci]['deadline'] < date:
-                        continue
-                    avail = credits[ci]['amount'] - match_debit.get(ci, 0)
-                    match_amt = min(remaining_debit, avail)
-                    match_debit[ci] = match_debit.get(ci, 0) + match_amt
-                    remaining_debit -= match_amt
-                    if abs(match_debit[ci] - credits[ci]['amount']) < 0.005:
+                    avail = credits[ci]['amount']
+                    if avail <= remaining_debit + 0.005:
+                        matched.add(ci)
                         removed.append(ci)
+                        remaining_debit -= avail
                 for ci in removed:
-                    if ci in pending:
-                        pending.remove(ci)
+                    pending.remove(ci)
+
+    # 数据遍历结束后，以最后日期为界再检查一次超期待查资金
+    if len(df) > 0:
+        last_date = df['日期对象'].max()
+        _expire_overdue(last_date)
 
     # ================================================================
-    # 4. 生成结果：未完全匹配的来账 → 可疑
+    # 4. 生成结果：超期未退回的待查资金 → 违规
     # ================================================================
     results = []
 
-    for ci, credit in enumerate(credits):
-        matched = match_debit.get(ci, 0.0)
-        if matched >= credit['amount'] - 0.005:
-            continue  # 已匹配
-
+    for ci in expired:
+        credit = credits[ci]
         row = credit['row']
         deadline_str = credit['deadline'].strftime('%Y-%m-%d')
 
@@ -1780,8 +1839,7 @@ def detect_settlement_verification(
     if len(results_df) > 0:
         results_df = results_df.sort_values('来源日期', ascending=False).reset_index(drop=True)
 
-    matched_count = sum(1 for ci in range(len(credits)) if match_debit.get(ci, 0) >= credits[ci]['amount'] - 0.005)
-    print(f"[清算核查] 待查:{len(credits)} 已匹配:{matched_count} 违规:{len(results_df)}")
+    print(f"[清算核查] 待查:{len(credits)} 已退回:{len(matched)} 违规:{len(results_df)}")
 
     return results_df
 
