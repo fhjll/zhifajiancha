@@ -1821,17 +1821,23 @@ def detect_settlement_verification(
         dt = dts[i]
         counterparty = counterparties[i]
 
-        # 先处理已超期的待查资金（不移出待查池）
-        _expire_overdue(date)
+        # ── 日期切换时输出进度 ──
+        if i == 0 or date != dates[i - 1] if i > 0 else True:
+            date_str = pd.Timestamp(date).strftime('%Y-%m-%d')
+            print(f"[清算核查] 处理 {date_str} 待查池:{sum(active)} 已退回:{len(matched)} 超期:{len(expired)}")
+
+        # 先处理已超期的待查资金，转为 Python datetime 给后续使用
+        py_date = pd.Timestamp(date).to_pydatetime()
+        _expire_overdue(py_date)
 
         if amount > 0:
             # ── 待查资金：非指定账户汇入 → 入队 ──
             if counterparty in designated_accounts:
                 continue
             ci = len(credits)
-            deadline = add_working_days(date, days_threshold)
+            deadline = add_working_days(py_date, days_threshold)
             credits.append({
-                'date': date, 'datetime': dt, 'amount': round(amount, 2),
+                'date': py_date, 'datetime': dt, 'amount': round(amount, 2),
                 'counterparty': counterparty,
                 'summary': summaries[i],
                 'deadline': deadline, 'row_idx': i,
@@ -1866,7 +1872,7 @@ def detect_settlement_verification(
                     # 附言笔数 < 剩余笔数，按金额匹配找出具体 N 笔
                     print(
                         f"[清算核查] 条数({len(eligible)}) > 笔数({batch_n})，需金额匹配: "
-                        f"{date.strftime('%Y-%m-%d')} {dt.strftime('%H:%M:%S')} "
+                        f"{py_date.strftime('%Y-%m-%d')} {dt.strftime('%H:%M:%S')} "
                         f"金额:{debit_amt}"
                     )
                     eligible_items = [credits[ci] for ci in eligible]
@@ -1896,8 +1902,27 @@ def detect_settlement_verification(
 
     # 数据遍历结束后，以最后日期为界再检查一次超期待查资金
     if len(df) > 0:
-        last_date = df['日期对象'].max()
+        last_date = pd.Timestamp(df['日期对象'].max()).to_pydatetime()
         _expire_overdue(last_date)
+
+    # ── 按日期输出汇总 ──
+    daily = {}
+    for ci, credit in enumerate(credits):
+        dk = credit['date'].strftime('%Y-%m-%d')
+        if dk not in daily:
+            daily[dk] = {'+待查': 0, '✓退回': 0, '✗超期': 0}
+        daily[dk]['+待查'] += 1
+        if ci in matched:
+            daily[dk]['✓退回'] += 1
+        if ci in expired:
+            daily[dk]['✗超期'] += 1
+    if daily:
+        print(f"\n{'日期':<12} {'新增待查':>6} {'已退回':>6} {'已超期':>6}")
+        print("-" * 34)
+        for dk in sorted(daily):
+            d = daily[dk]
+            print(f"{dk:<12} {d['+待查']:>6} {d['✓退回']:>6} {d['✗超期']:>6}")
+        print()
 
     # ================================================================
     # 4. 生成结果：超期未退回的待查资金 → 违规
