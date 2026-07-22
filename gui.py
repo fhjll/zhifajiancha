@@ -158,7 +158,7 @@ class App(ctk.CTk):
         title_frame.grid(row=0, column=0, sticky="ew", padx=24, pady=(16, 6))
         title_frame.grid_columnconfigure(1, weight=1)
 
-        # LLM 配置按钮（左上角）
+        # LLM 配置按钮 + 版本号（左上角）
         self.llm_config_btn = ctk.CTkButton(
             title_frame, text="⚙  大模型配置",
             font=ctk.CTkFont(size=12),
@@ -169,17 +169,22 @@ class App(ctk.CTk):
         self.llm_config_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
 
         ctk.CTkLabel(
+            title_frame, text="v1.0",
+            font=ctk.CTkFont(size=11), text_color="gray",
+        ).grid(row=0, column=1, sticky="w", padx=(0, 12))
+
+        ctk.CTkLabel(
             title_frame,
             text=self.TITLE,
             font=ctk.CTkFont(size=22, weight="bold"),
-        ).grid(row=0, column=1, sticky="w", padx=(0, 12))
+        ).grid(row=0, column=2, sticky="w", padx=(0, 12))
 
         ctk.CTkLabel(
             title_frame,
             text="清算退款 | 非税收入 | 文书生成",
             font=ctk.CTkFont(size=13),
             text_color="gray",
-        ).grid(row=0, column=2, sticky="w")
+        ).grid(row=0, column=3, sticky="w")
 
         # ── 三标签页 ──
         self.tabview = ctk.CTkTabview(self, corner_radius=10)
