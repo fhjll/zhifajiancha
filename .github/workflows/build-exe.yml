@@ -10,10 +10,10 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-2019  # Python 3.8 避免 numpy ABI 不兼容
+    runs-on: windows-latest
     strategy:
       matrix:
-        python-version: ["3.8"]
+        python-version: ["3.11"]
 
     steps:
       - name: Checkout code
@@ -24,11 +24,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
+      - name: Install dependencies (pinned for ABI compat)
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller==5.13.2
-          pip install numpy==1.23.5 pandas==1.5.3 openpyxl python-docx openai customtkinter
+          pip install pyinstaller==6.12.0
+          pip install numpy==2.2.0 pandas openpyxl python-docx openai customtkinter
 
       - name: Build EXE (via spec)
         run: pyinstaller 执法检测系统_Win_x64.spec
