@@ -1633,9 +1633,9 @@ def detect_settlement_verification(
     # 2. 划转账户归一化：支持单个字符串或列表
     # ================================================================
     if isinstance(designated_account, str):
-        designated_accounts = {designated_account}
+        designated_accounts = {designated_account.strip()}
     else:
-        designated_accounts = set(designated_account)
+        designated_accounts = {a.strip() for a in designated_account}
 
     # ================================================================
     # 3. FIFO 累计匹配：多笔来账可被一笔划转合并（多对一）
@@ -1677,10 +1677,14 @@ def detect_settlement_verification(
 
                 exact_matched = False
                 if batch_n is not None and len(pending) >= batch_n:
-                    # 优先级高：前 N 笔合计 = 转出金额 → 精确匹配 N 笔
+                    # 优先级高：前 N 笔合计 = 转出金额，且均在窗口内 → 精确匹配
                     batch_items = pending[:batch_n]
                     batch_sum = sum(it['remaining'] for it in batch_items)
-                    if abs(batch_sum - debit_amt) < 0.005:
+                    all_in_window = all(
+                        add_working_days(credits[it['credit_idx']]['date'], days_threshold) >= date
+                        for it in batch_items
+                    )
+                    if all_in_window and abs(batch_sum - debit_amt) < 0.005:
                         for it in batch_items:
                             match_results[it['credit_idx']] = it['remaining']
                         del pending[:batch_n]
