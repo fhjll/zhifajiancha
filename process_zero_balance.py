@@ -1655,13 +1655,17 @@ def detect_settlement_verification(
         designated_accounts = {a.strip() for a in designated_account}
 
     # ================================================================
-    # 3. FIFO 累计匹配：多笔来账可被一笔划转合并（多对一）
+    # 3. 匹配逻辑：
+    #    - 待查资金 = 非指定账户汇入
+    #    - 匹配资金 = 汇往指定账户的出账
+    #    - 根据附言中"共N笔"：N==待查数 → 全匹配；N<待查数 → 金额匹配
+    #    - 超 deadline 未匹配 → 违规
     # ================================================================
     df = df.sort_values('日期对象').reset_index(drop=True)
 
-    credits = []           # [{date, amount, counterparty, summary, row}]
-    pending = []           # FIFO 队列: [{credit_idx, remaining}]
-    match_results = {}     # credit_idx → matched_amount
+    credits = []      # [{date, amount, counterparty, summary, row}]
+    pending = []      # [credit_idx] 按时间顺序
+    match_debit = {}  # credit_idx → matched_amount
 
     for _, row in df.iterrows():
         amount = row['交易金额']
@@ -1671,56 +1675,73 @@ def detect_settlement_verification(
         counterparty = str(row.get('对方户名', '')).strip()
 
         if amount > 0:
-            # ── 来账 → 排除指定账户来的，其余入 FIFO ──
+            # ── 待查资金：非指定账户汇入 → 入队 ──
             if counterparty in designated_accounts:
                 continue
             ci = len(credits)
+            deadline = add_working_days(date, days_threshold)
             credits.append({
                 'date': date, 'amount': round(amount, 2),
                 'counterparty': counterparty,
                 'summary': str(row.get('摘要', '') or ''),
-                'row': row,
+                'deadline': deadline, 'row': row,
             })
-            pending.append({'credit_idx': ci, 'remaining': round(amount, 2)})
-            match_results[ci] = 0.0
+            pending.append(ci)
+            match_debit[ci] = 0.0
 
         elif amount < 0:
-            # ── 出账 → 若对方为指定账户，FIFO 消耗 ──
-            if counterparty in designated_accounts:
-                debit_amt = round(abs(amount), 2)
-                remarks = str(row.get('附言', '') or row.get('摘要', '') or '')
-                m = re.search(r'共\s*(\d+)\s*笔', remarks)
-                batch_n = int(m.group(1)) if m else None
+            # ── 匹配资金 → 尝试匹配待查资金 ──
+            if counterparty not in designated_accounts:
+                continue
+            debit_amt = round(abs(amount), 2)
+            remarks = str(row.get('附言', '') or row.get('摘要', '') or '')
+            m = re.search(r'共\s*(\d+)\s*笔', remarks)
+            batch_n = int(m.group(1)) if m else None
 
-                exact_matched = False
-                if batch_n is not None and len(pending) >= batch_n:
-                    # 优先级高：前 N 笔合计 = 转出金额，且均在窗口内 → 精确匹配
-                    batch_items = pending[:batch_n]
-                    batch_sum = sum(it['remaining'] for it in batch_items)
-                    all_in_window = all(
-                        add_working_days(credits[it['credit_idx']]['date'], days_threshold) >= date
-                        for it in batch_items
-                    )
-                    if all_in_window and abs(batch_sum - debit_amt) < 0.005:
-                        for it in batch_items:
-                            match_results[it['credit_idx']] = it['remaining']
-                        del pending[:batch_n]
-                        exact_matched = True
+            # 当前在窗口内的待查资金（日期 ≤ 出账日期，且 deadline ≥ 出账日期）
+            window_pending = [ci for ci in pending
+                              if credits[ci]['date'] <= date and credits[ci]['deadline'] >= date]
 
-                if not exact_matched:
-                    # 优先级低：自由 FIFO（无附言，或精确匹配失败回退）
-                    while debit_amt > 0.005 and pending:
-                        oldest = pending[0]
-                        window_end = add_working_days(credits[oldest['credit_idx']]['date'], days_threshold)
-                        if date > window_end:
-                            pending.pop(0)
-                            continue
-                        match_amt = min(debit_amt, oldest['remaining'])
-                        match_results[oldest['credit_idx']] += match_amt
-                        oldest['remaining'] -= match_amt
-                        debit_amt -= match_amt
-                        if oldest['remaining'] < 0.005:
-                            pending.pop(0)
+            matched = False
+            if batch_n is not None and window_pending:
+                if batch_n >= len(window_pending):
+                    # N >= 待查数 → 全部匹配
+                    window_sum = sum(credits[ci]['amount'] - match_debit.get(ci, 0) for ci in window_pending)
+                    if abs(window_sum - debit_amt) < 0.005:
+                        for ci in window_pending:
+                            match_debit[ci] = credits[ci]['amount']
+                            if ci in pending:
+                                pending.remove(ci)
+                        matched = True
+                else:
+                    # N < 待查数 → 从前 N 笔开始尝试 FIFO + 金额累计
+                    candidates = window_pending[:batch_n]
+                    cand_sum = sum(credits[ci]['amount'] - match_debit.get(ci, 0) for ci in candidates)
+                    if abs(cand_sum - debit_amt) < 0.005:
+                        for ci in candidates:
+                            match_debit[ci] = credits[ci]['amount']
+                            if ci in pending:
+                                pending.remove(ci)
+                        matched = True
+
+            # 无附言或匹配失败 → 回退到自由 FIFO
+            if not matched and pending:
+                remaining_debit = debit_amt
+                removed = []
+                for ci in list(pending):
+                    if remaining_debit < 0.005:
+                        break
+                    if credits[ci]['date'] > date or credits[ci]['deadline'] < date:
+                        continue
+                    avail = credits[ci]['amount'] - match_debit.get(ci, 0)
+                    match_amt = min(remaining_debit, avail)
+                    match_debit[ci] = match_debit.get(ci, 0) + match_amt
+                    remaining_debit -= match_amt
+                    if abs(match_debit[ci] - credits[ci]['amount']) < 0.005:
+                        removed.append(ci)
+                for ci in removed:
+                    if ci in pending:
+                        pending.remove(ci)
 
     # ================================================================
     # 4. 生成结果：未完全匹配的来账 → 可疑
@@ -1728,12 +1749,12 @@ def detect_settlement_verification(
     results = []
 
     for ci, credit in enumerate(credits):
-        matched = match_results.get(ci, 0.0)
+        matched = match_debit.get(ci, 0.0)
         if matched >= credit['amount'] - 0.005:
-            continue  # 完全匹配
+            continue  # 已匹配
 
         row = credit['row']
-        window_end = add_working_days(credit['date'], days_threshold)
+        deadline_str = credit['deadline'].strftime('%Y-%m-%d')
 
         cpty_acct = ''
         for c in ('对方账号', '对方帐号'):
@@ -1750,17 +1771,17 @@ def detect_settlement_verification(
             '摘要': credit['summary'],
             '对方账号': cpty_acct,
             '来账对方户名': credit['counterparty'],
-            '窗口截止': window_end.strftime('%Y-%m-%d'),
+            '窗口截止': deadline_str,
             '窗口工作日': days_threshold,
-            '状态': '可疑',
+            '状态': '违规',
         })
 
     results_df = pd.DataFrame(results)
     if len(results_df) > 0:
         results_df = results_df.sort_values('来源日期', ascending=False).reset_index(drop=True)
 
-    matched_count = sum(1 for ci in range(len(credits)) if match_results.get(ci, 0) >= credits[ci]['amount'] - 0.005)
-    print(f"[清算核查] 来账:{len(credits)} 已匹配:{matched_count} 可疑:{len(results_df)}")
+    matched_count = sum(1 for ci in range(len(credits)) if match_debit.get(ci, 0) >= credits[ci]['amount'] - 0.005)
+    print(f"[清算核查] 待查:{len(credits)} 已匹配:{matched_count} 违规:{len(results_df)}")
 
     return results_df
 
