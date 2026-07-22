@@ -64,7 +64,7 @@ def _safe_float(v: str, default: float) -> float:
 
 def _parse_multi_account(account_str: str):
     """解析逗号分隔的多账户字符串，返回列表（多个）或字符串（单个）"""
-    parts = [a.strip() for a in account_str.split(',') if a.strip()]
+    parts = [a.strip() for a in account_str.replace('，', ',').split(',') if a.strip()]
     return parts if len(parts) > 1 else (parts[0] if parts else account_str)
 
 
