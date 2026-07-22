@@ -1715,8 +1715,8 @@ def detect_settlement_verification(
 
     # 提取列为 NumPy 数组遍历，避免 to_dict/iterrows 的开销
     amounts = df['交易金额'].values
-    dates = df['日期对象'].values
-    dts = df['时间对象'].values
+    dates = pd.to_datetime(df['日期对象']).to_pydatetime()
+    dts = pd.to_datetime(df['时间对象']).to_pydatetime()
     counterparties = (
         df['对方户名'].fillna('').astype(str).str.strip().values
         if '对方户名' in df.columns else [''] * len(df)
