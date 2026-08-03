@@ -79,6 +79,7 @@ def run_pipeline(
     settlement_check=None,
     settlement_account="待报解预算收入",
     settlement_days=2,
+    settlement_confirm=None,
     max_workers=1,
 ):
     """
@@ -215,9 +216,12 @@ def run_pipeline(
             file_path=settlement_check,
             designated_account=settlement_account,
             days_threshold=settlement_days,
+            confirm_file_path=settlement_confirm,
         )
 
         sc_output = os.path.join(output_dir, "清算核查结果.xlsx")
+        if settlement_confirm:
+            print(f"  二次确认CSV: {settlement_confirm}")
         if len(sc_results) == 0:
             print("  未发现可疑记录（所有来账后均有划转）")
             pd.DataFrame(columns=[
@@ -313,6 +317,11 @@ def main():
         help="清算核查未划转阈值天数 (默认: 2)",
     )
     parser.add_argument(
+        "--settlement-confirm",
+        default="",
+        help="清算核查二次确认 CSV 文件路径（可选，2302 凭证确认）",
+    )
+    parser.add_argument(
         "--output-dir",
         default="output",
         help="输出目录 (默认: output)",
@@ -397,6 +406,7 @@ def main():
         settlement_check=args.settlement_check or None,
         settlement_account=settlement_account_list or args.settlement_account,
         settlement_days=args.settlement_days,
+        settlement_confirm=args.settlement_confirm or None,
         max_workers=args.workers,
     )
 
