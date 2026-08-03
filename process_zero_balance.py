@@ -1917,7 +1917,7 @@ def detect_settlement_verification(
     confirm_file_path: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    清算退款确认：对流水文件中的每一笔退款，逐笔匹配确认 CSV。
+    清算退款确认：先排除目标账户内部来账，再对流水文件中的每一笔退款逐笔匹配确认 CSV。
 
     匹配规则：
     - 确认 CSV 凭证日期在来源日期起的 days_threshold 个工作日内
@@ -1931,13 +1931,29 @@ def detect_settlement_verification(
     if not confirm_file_path:
         raise ValueError("清算退款确认必须提供确认 CSV 文件路径")
 
+    if isinstance(designated_account, str):
+        account_parts = [
+            a.strip()
+            for a in designated_account.replace('，', ',').split(',')
+            if a.strip()
+        ]
+    else:
+        account_parts = [str(a).strip() for a in (designated_account or [])]
+    designated_accounts = {
+        _normalize_confirm_text_value(a) for a in account_parts
+    }
+
     confirm_df = _load_settlement_confirm_csv(confirm_file_path)
     by_key = {}
     for idx, row in confirm_df.iterrows():
         key = (row['日期对象'].date(), row['付款人名称'], row['付款人账号'])
         by_key.setdefault(key, []).append((idx, row['发生额']))
 
-    refunds, file_label, account_num = _load_settlement_refund_records(file_path)
+    inflows, file_label, account_num = _load_settlement_refund_records(file_path)
+    refunds = [
+        r for r in inflows
+        if r['counterparty'] not in designated_accounts
+    ]
     matched_confirm = set()
     results = []
 
@@ -1982,7 +1998,8 @@ def detect_settlement_verification(
         results_df = results_df.sort_values('来源日期', ascending=False).reset_index(drop=True)
 
     print(
-        f"[清算退款确认] 退款:{len(refunds)} 已确认:{len(matched_confirm)} "
+        f"[清算退款确认] 来账:{len(inflows)} 退款:{len(refunds)} "
+        f"已确认:{len(matched_confirm)} "
         f"可疑:{len(results_df)}"
     )
     return results_df
