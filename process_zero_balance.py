@@ -13,7 +13,7 @@ import os
 import json
 import bisect
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -452,15 +452,85 @@ def _detect_header_row(xls, sheet_name, max_rows=15):
 
     return best_row
 
+# =========================
+# 官方工作日历（国务院放假安排）
+# =========================
+
+# 2025-2026 年官方节假日（含 2026 年后续安排，保证 2026-04-30 的下一工作日计算准确）
+_OFFICIAL_HOLIDAYS = {
+    # 2025 元旦
+    date(2025, 1, 1),
+    # 2025 春节
+    date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
+    date(2025, 1, 31), date(2025, 2, 1), date(2025, 2, 2),
+    date(2025, 2, 3), date(2025, 2, 4),
+    # 2025 清明节
+    date(2025, 4, 4), date(2025, 4, 5), date(2025, 4, 6),
+    # 2025 劳动节
+    date(2025, 5, 1), date(2025, 5, 2), date(2025, 5, 3),
+    date(2025, 5, 4), date(2025, 5, 5),
+    # 2025 端午节
+    date(2025, 5, 31), date(2025, 6, 1), date(2025, 6, 2),
+    # 2025 国庆节、中秋节
+    date(2025, 10, 1), date(2025, 10, 2), date(2025, 10, 3),
+    date(2025, 10, 4), date(2025, 10, 5), date(2025, 10, 6),
+    date(2025, 10, 7), date(2025, 10, 8),
+    # 2026 元旦
+    date(2026, 1, 1), date(2026, 1, 2), date(2026, 1, 3),
+    # 2026 春节
+    date(2026, 2, 15), date(2026, 2, 16), date(2026, 2, 17),
+    date(2026, 2, 18), date(2026, 2, 19), date(2026, 2, 20),
+    date(2026, 2, 21), date(2026, 2, 22), date(2026, 2, 23),
+    # 2026 清明节
+    date(2026, 4, 4), date(2026, 4, 5), date(2026, 4, 6),
+    # 2026 劳动节
+    date(2026, 5, 1), date(2026, 5, 2), date(2026, 5, 3),
+    date(2026, 5, 4), date(2026, 5, 5),
+    # 2026 端午节
+    date(2026, 6, 19), date(2026, 6, 20), date(2026, 6, 21),
+    # 2026 中秋节
+    date(2026, 9, 25), date(2026, 9, 26), date(2026, 9, 27),
+    # 2026 国庆节
+    date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 3),
+    date(2026, 10, 4), date(2026, 10, 5), date(2026, 10, 6),
+    date(2026, 10, 7),
+}
+
+# 官方调休上班日（周末上班）
+_OFFICIAL_WORKDAYS = {
+    date(2025, 1, 26),
+    date(2025, 2, 8),
+    date(2025, 4, 27),
+    date(2025, 9, 28),
+    date(2025, 10, 11),
+    date(2026, 1, 4),
+    date(2026, 2, 14),
+    date(2026, 2, 28),
+    date(2026, 5, 9),
+    date(2026, 9, 20),
+    date(2026, 10, 10),
+}
+
+
 def is_weekend(dt):
     """判断是否为周末"""
     return dt.weekday() >= 5
 
 
+def is_working_day(dt):
+    """判断是否为工作日，包含官方调休上班日，排除官方节假日。"""
+    d = dt.date() if isinstance(dt, datetime) else dt
+    if d in _OFFICIAL_WORKDAYS:
+        return True
+    if d in _OFFICIAL_HOLIDAYS:
+        return False
+    return not is_weekend(dt)
+
+
 def next_workday(dt):
-    """获取下一个工作日"""
+    """获取下一个工作日（跳过周末和法定节假日，调休上班日视为工作日）"""
     nxt = dt + timedelta(days=1)
-    while is_weekend(nxt):
+    while not is_working_day(nxt):
         nxt += timedelta(days=1)
     return nxt
 
@@ -476,24 +546,24 @@ def is_within_same_or_next_workday(date1, date2):
 
 def add_working_days(dt, n):
     """
-    往后加 n 个工作日（跳过周末）。
+    往后加 n 个工作日（跳过周末和法定节假日，调休上班日视为工作日）。
 
-    >>> add_working_days(datetime(2026, 4, 28), 2)  # 周二 → 周四
-    datetime(2026, 4, 30)
-    >>> add_working_days(datetime(2026, 4, 30), 1)  # 周四 → 周五
-    datetime(2026, 5, 1)
+    >>> add_working_days(datetime(2026, 4, 28), 1)  # 周二 → 周三
+    datetime(2026, 4, 29)
+    >>> add_working_days(datetime(2026, 4, 30), 1)  # 周四 → 跳过五一假期
+    datetime(2026, 5, 6)
     """
     result = dt
     for _ in range(n):
         result += timedelta(days=1)
-        while is_weekend(result):
+        while not is_working_day(result):
             result += timedelta(days=1)
     return result
 
 
 def working_days_between(d1, d2):
     """
-    计算 d1 到 d2 之间的工作日数（不含 d1，含 d2）。
+    计算 d1 到 d2 之间的工作日数（不含 d1，含 d2，按官方节假日及调休计算）。
 
     >>> working_days_between(datetime(2026, 4, 28), datetime(2026, 4, 29))  # 周二→周三
     1
@@ -506,7 +576,7 @@ def working_days_between(d1, d2):
     current = d1
     while current < d2:
         current += timedelta(days=1)
-        if not is_weekend(current):
+        if is_working_day(current):
             count += 1
     return count
 
@@ -1230,7 +1300,7 @@ def detect_non_tax_verification(
       - 当天划转一部分，剩余第二天同新来账一起划转
     - 零余额检测：若某笔交易后余额为零，则截至当时的所有待匹配来账均视为已划转
       - 此类记录备注标注"余额归零"
-    - 工作日计算：跳过周六周日
+    - 工作日计算：跳过周末和法定节假日，调休上班日视为工作日
 
     参数
     ----------
@@ -1754,7 +1824,7 @@ def confirm_settlement_suspicious(suspicious_df, confirm_file_path):
 def detect_settlement_verification(
     file_path: str,
     designated_account = '待报解预算收入',
-    days_threshold: int = 2,
+    days_threshold: int = 1,
     confirm_file_path: Optional[str] = None,
 ) -> pd.DataFrame:
     """
@@ -1779,7 +1849,7 @@ def detect_settlement_verification(
         指定划转账户的对方户名，支持多个；
         默认 "待报解预算收入"
     days_threshold : int
-        工作日阈值（默认 2）。待查资金超过此工作日未退回 → 标记"违规"
+        工作日阈值（默认 1）。待查资金超过此工作日未退回 → 标记"违规"
     confirm_file_path : str, optional
         二次确认 CSV 文件路径。提供时，会按 2302 凭证记录剔除已确认的可疑记录。
 
