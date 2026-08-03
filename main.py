@@ -224,6 +224,7 @@ def run_pipeline(
 
         sc_output = os.path.join(output_dir, "清算核查结果.xlsx")
         print(f"  确认CSV: {settlement_confirm}")
+        print(f"  目标账户: {settlement_account}")
         if len(sc_results) == 0:
             print("  未发现可疑记录（所有退款均在窗口内确认）")
             pd.DataFrame(columns=[
@@ -310,7 +311,7 @@ def main():
     parser.add_argument(
         "--settlement-account",
         default="待报解预算收入",
-        help="兼容参数，新清算退款确认逻辑不再使用",
+        help="目标账户（对方户名），用于排除目标账户内部来账，多个用逗号分隔",
     )
     parser.add_argument(
         "--settlement-days",
