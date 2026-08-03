@@ -1322,6 +1322,12 @@ def detect_non_tax_verification(
         - 末尾附汇总行
     """
     # ================================================================
+    # 0. 文件夹由 GUI/CLI 逐文件调用本函数处理，并分别保存结果
+    # ================================================================
+    if os.path.isdir(file_path):
+        raise ValueError("非税收入核查文件夹模式请通过界面或命令行逐文件处理")
+
+    # ================================================================
     # 1. 加载数据
     # ================================================================
     if _is_csv_file(file_path):
@@ -1409,6 +1415,21 @@ def detect_non_tax_verification(
 
         date = row['日期对象']
 
+        # === 零余额检测优先：当前余额为零 → 截至当天待匹配来账全部视为已划转 ===
+        if balance_col:
+            bal = row.get(balance_col)
+            if pd.notna(bal) and float(bal) == 0.0:
+                for pc in list(pending):
+                    if pc['remaining'] > 0.005:
+                        match_records[pc['credit_idx']].append({
+                            'date': date,
+                            'amount': pc['remaining'],
+                            'bank': '',
+                            'type': 'zero_balance',
+                        })
+                        pc['remaining'] = 0.0
+                pending.clear()
+
         if amount > 0:
             # === 来账（收入） → 加入待匹配池 ===
             cpty_acct = ''
@@ -1450,21 +1471,6 @@ def detect_non_tax_verification(
                     debit_amt = debit_amt - match_amt
                     if oldest['remaining'] < 0.005:
                         pending.pop(0)
-
-        # === 零余额检测：当前交易后余额为零 → 待匹配来账全部视为已划转 ===
-        if balance_col and pending:
-            bal = row.get(balance_col)
-            if pd.notna(bal) and float(bal) == 0.0:
-                for pc in list(pending):
-                    if pc['remaining'] > 0.005:
-                        match_records[pc['credit_idx']].append({
-                            'date': date,
-                            'amount': pc['remaining'],
-                            'bank': '',
-                            'type': 'zero_balance',
-                        })
-                        pc['remaining'] = 0.0
-                pending.clear()
 
     # ================================================================
     # 3. 生成结果：根据匹配记录判定每条来账的状态
