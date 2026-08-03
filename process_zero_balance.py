@@ -1910,23 +1910,26 @@ def _load_settlement_refund_records(file_path):
     return refunds, file_label, account_num
 
 
-def detect_settlement_verification(
+def detect_settlement_refund_matching(
     file_path: str,
     designated_account = '待报解预算收入',
     days_threshold: int = 2,
     confirm_file_path: Optional[str] = None,
-) -> pd.DataFrame:
+) -> dict:
     """
-    清算退款确认：先排除目标账户内部来账，再对流水文件中的每一笔退款逐笔匹配确认 CSV。
+    清算退款逐笔匹配：先排除目标账户内部来账，再对每笔退款按时间顺序匹配确认 CSV。
 
     匹配规则：
-    - 确认 CSV 凭证日期在来源日期起的 days_threshold 个工作日内
+    - 只使用来源日期当天及之后的所有确认记录，按日期先后取第一笔匹配
     - 付款人名称 = 来账对方户名
     - 付款人账号 = 对方账号
     - 凭证类型编号 = 2302
     - abs(确认 CSV 发生额 × 100) == abs(来源金额)
 
-    在窗口内找不到匹配记录时，该笔退款视为可疑记录。
+    结果分类：
+    - 两个工作日内匹配：不保存
+    - 匹配日期超过两个工作日：保存为“超期匹配”
+    - 未匹配到任何确认记录：保存为“未匹配”
     """
     if not confirm_file_path:
         raise ValueError("清算退款确认必须提供确认 CSV 文件路径")
@@ -1944,10 +1947,14 @@ def detect_settlement_verification(
     }
 
     confirm_df = _load_settlement_confirm_csv(confirm_file_path)
-    by_key = {}
+    confirm_by_party = {}
     for idx, row in confirm_df.iterrows():
-        key = (row['日期对象'].date(), row['付款人名称'], row['付款人账号'])
-        by_key.setdefault(key, []).append((idx, row['发生额']))
+        key = (row['付款人名称'], row['付款人账号'])
+        confirm_by_party.setdefault(key, []).append(
+            (row['日期对象'].date(), idx, row['发生额'])
+        )
+    for key in confirm_by_party:
+        confirm_by_party[key].sort(key=lambda x: x[0])
 
     inflows, file_label, account_num = _load_settlement_refund_records(file_path)
     refunds = [
@@ -1955,32 +1962,32 @@ def detect_settlement_verification(
         if r['counterparty'] not in designated_accounts
     ]
     matched_confirm = set()
-    results = []
+    overdue_results = []
+    unmatched_results = []
 
     for refund in refunds:
         source_date = refund['date']
-        end_date = add_working_days(source_date, days_threshold)
-        current = source_date
-        found = False
+        source_day = source_date.date() if isinstance(source_date, datetime) else source_date
+        deadline = add_working_days(source_date, days_threshold).date()
+        key = (refund['counterparty'], refund['account'])
+        matched = None
 
-        while current <= end_date:
-            d = current.date() if isinstance(current, datetime) else current
-            for confirm_idx, confirm_amount in by_key.get((d, refund['counterparty'], refund['account']), []):
-                if (
-                    confirm_idx not in matched_confirm
-                    and confirm_amount is not None
-                    and refund['amount'] is not None
-                    and round(abs(confirm_amount * 100)) == round(abs(refund['amount']))
-                ):
-                    matched_confirm.add(confirm_idx)
-                    found = True
-                    break
-            if found:
+        for confirm_date, confirm_idx, confirm_amount in confirm_by_party.get(key, []):
+            if confirm_date < source_day:
+                continue
+            if confirm_idx in matched_confirm:
+                continue
+            if (
+                confirm_amount is not None
+                and refund['amount'] is not None
+                and round(abs(confirm_amount * 100)) == round(abs(refund['amount']))
+            ):
+                matched_confirm.add(confirm_idx)
+                matched = (confirm_date, confirm_amount)
                 break
-            current += timedelta(days=1)
 
-        if not found:
-            results.append({
+        if matched is None:
+            unmatched_results.append({
                 '文件来源': file_label,
                 '账号': account_num,
                 '来源日期': source_date.strftime('%Y-%m-%d'),
@@ -1988,21 +1995,60 @@ def detect_settlement_verification(
                 '摘要': refund['summary'],
                 '对方账号': refund['account'],
                 '来账对方户名': refund['counterparty'],
-                '窗口截止': end_date.strftime('%Y-%m-%d'),
+                '匹配日期': '',
+                '匹配金额': '',
+                '窗口截止': deadline.strftime('%Y-%m-%d'),
                 '窗口工作日': days_threshold,
-                '状态': '可疑',
+                '状态': '未匹配',
+            })
+        elif matched[0] > deadline:
+            overdue_results.append({
+                '文件来源': file_label,
+                '账号': account_num,
+                '来源日期': source_date.strftime('%Y-%m-%d'),
+                '来源金额': refund['amount'],
+                '摘要': refund['summary'],
+                '对方账号': refund['account'],
+                '来账对方户名': refund['counterparty'],
+                '匹配日期': matched[0].strftime('%Y-%m-%d'),
+                '匹配金额': matched[1],
+                '窗口截止': deadline.strftime('%Y-%m-%d'),
+                '窗口工作日': days_threshold,
+                '状态': '超期匹配',
             })
 
-    results_df = pd.DataFrame(results)
-    if len(results_df) > 0:
-        results_df = results_df.sort_values('来源日期', ascending=False).reset_index(drop=True)
+    overdue_df = pd.DataFrame(overdue_results)
+    unmatched_df = pd.DataFrame(unmatched_results)
+    for df in (overdue_df, unmatched_df):
+        if len(df) > 0:
+            df.sort_values('来源日期', ascending=False, inplace=True)
+            df.reset_index(drop=True, inplace=True)
 
     print(
         f"[清算退款确认] 来账:{len(inflows)} 退款:{len(refunds)} "
-        f"已确认:{len(matched_confirm)} "
-        f"可疑:{len(results_df)}"
+        f"窗口内匹配:{len(refunds) - len(overdue_results) - len(unmatched_results)} "
+        f"超期匹配:{len(overdue_results)} 未匹配:{len(unmatched_results)}"
     )
-    return results_df
+    return {
+        'matched': len(refunds) - len(overdue_results) - len(unmatched_results),
+        'overdue': overdue_df,
+        'unmatched': unmatched_df,
+    }
+
+
+def detect_settlement_verification(
+    file_path: str,
+    designated_account = '待报解预算收入',
+    days_threshold: int = 2,
+    confirm_file_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """兼容入口：返回未匹配记录。"""
+    return detect_settlement_refund_matching(
+        file_path=file_path,
+        designated_account=designated_account,
+        days_threshold=days_threshold,
+        confirm_file_path=confirm_file_path,
+    )['unmatched']
 
 
 # =========================
