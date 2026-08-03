@@ -18,7 +18,7 @@ import pandas as pd
 
 import customtkinter as ctk
 
-from process_zero_balance import detect_fund_matching, detect_non_tax_verification, detect_settlement_verification
+from process_zero_balance import detect_fund_matching, detect_non_tax_verification, detect_settlement_refund_matching
 from generate_report import batch_generate
 from preprocess import preprocess_transactions, detect_end_of_day_nonzero
 from logger import setup_logging, log_message, get_log_path
@@ -1164,31 +1164,35 @@ class App(ctk.CTk):
         self._log_result(f"  目标账户: {account_name}")
         self._log_result(f"  窗口工作日: {threshold}")
 
-        results = detect_settlement_verification(
+        results = detect_settlement_refund_matching(
             file_path=file_path,
             designated_account=_parse_multi_account(account_name),
             days_threshold=threshold,
             confirm_file_path=confirm_path,
         )
 
-        output_path = os.path.join(out_dir, "清算核查结果.xlsx")
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        overdue_path = os.path.join(out_dir, f"{base_name}_超期匹配.xlsx")
+        unmatched_path = os.path.join(out_dir, f"{base_name}_未匹配.xlsx")
+        overdue_df = results.get('overdue', pd.DataFrame())
+        unmatched_df = results.get('unmatched', pd.DataFrame())
+        result_columns = [
+            '文件来源', '账号', '来源日期', '来源金额', '摘要',
+            '对方账号', '来账对方户名', '匹配日期', '匹配金额',
+            '窗口截止', '窗口工作日', '状态',
+        ]
 
-        if len(results) == 0:
-            self._log_success("未发现可疑记录（所有退款均在窗口内确认）")
-            # 仍然保存空结果文件
-            pd.DataFrame(columns=['文件来源', '账号', '来源日期', '来源金额', '摘要',
-                                  '对方账号', '来账对方户名', '窗口截止', '窗口工作日', '状态']
-                        ).to_excel(output_path, index=False)
-        else:
-            results.to_excel(output_path, index=False)
-            self._log_result(f"  可疑记录数: {len(results)}")
-            for _, row in results.iterrows():
-                self._log_result(
-                    f"    {row['来源日期']} | 金额:{row['来源金额']} | "
-                    f"来账方:{row['来账对方户名']} | 窗口截止:{row['窗口截止']}"
-                )
-
-        self._log_success(f"清算核查结果已保存: {output_path}")
+        pd.DataFrame(overdue_df if len(overdue_df) else None, columns=result_columns).to_excel(
+            overdue_path, index=False
+        )
+        pd.DataFrame(unmatched_df if len(unmatched_df) else None, columns=result_columns).to_excel(
+            unmatched_path, index=False
+        )
+        self._log_result(f"  窗口内匹配: {results.get('matched', 0)}")
+        self._log_result(f"  超期匹配记录数: {len(overdue_df)}")
+        self._log_result(f"  未匹配记录数: {len(unmatched_df)}")
+        self._log_success(f"超期匹配结果已保存: {overdue_path}")
+        self._log_success(f"未匹配结果已保存: {unmatched_path}")
         self._log_step("═══════════════════════════════")
         self._log_success("清算退款确认完成！")
 
