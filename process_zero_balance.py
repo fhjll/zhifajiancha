@@ -1542,6 +1542,212 @@ def detect_non_tax_verification(
 
 
 # =========================
+# 清算核查二次确认
+# =========================
+
+
+def _normalize_confirm_account_value(value):
+    """归一化账号，避免科学计数法导致的精度丢失。"""
+    if pd.isna(value):
+        return ''
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        try:
+            if float(value).is_integer():
+                return str(int(value))
+        except (ValueError, TypeError, OverflowError):
+            pass
+        return str(value).strip()
+    return str(value).strip()
+
+
+def _normalize_confirm_text_value(value):
+    """归一化户名，忽略名称中的空白差异。"""
+    if pd.isna(value):
+        return ''
+    return ''.join(str(value).split())
+
+
+def _normalize_confirm_code_value(value):
+    """归一化凭证类型，兼容 2302 / 2302.0 / '2302'。"""
+    if pd.isna(value):
+        return ''
+    try:
+        num = float(str(value).strip())
+        if num.is_integer():
+            return str(int(num))
+    except (ValueError, TypeError):
+        pass
+    return str(value).strip()
+
+
+def _normalize_confirm_numeric_series(series):
+    """将 CSV 金额列转换为数值，兼容千分位和人民币符号。"""
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors='coerce')
+    cleaned = (
+        series.astype(str)
+        .str.replace(',', '', regex=False)
+        .str.replace('，', '', regex=False)
+        .str.replace('￥', '', regex=False)
+        .str.replace('元', '', regex=False)
+        .str.strip()
+    )
+    return pd.to_numeric(cleaned, errors='coerce')
+
+
+def _parse_confirm_date(value):
+    """解析二次确认 CSV 的日期，兼容带时间的日期字符串。"""
+    parsed = parse_date(value)
+    if parsed is not None:
+        return parsed
+    try:
+        ts = pd.to_datetime(value, errors='coerce')
+        if pd.notna(ts):
+            return ts.to_pydatetime()
+    except Exception:
+        pass
+    return None
+
+
+def _load_settlement_confirm_csv(filepath):
+    """加载二次确认 CSV，并仅保留符合 2302 金额换算规则的记录。"""
+    if not _is_csv_file(filepath):
+        raise ValueError(f"二次确认数据需为 CSV 文件: {filepath}")
+
+    _, df = _load_dataframe(filepath)
+    if len(df) == 0:
+        return pd.DataFrame()
+
+    alias_map = {
+        '付款人名称': '付款人名称',
+        '付款人户名': '付款人名称',
+        '付款人姓名': '付款人名称',
+        '付款人账号': '付款人账号',
+        '付款人帐号': '付款人账号',
+        '凭证类型': '凭证类型',
+        '票据类型': '凭证类型',
+        '支付金额': '支付金额',
+        '付款金额': '支付金额',
+        '发生额': '发生额',
+        '发生金额': '发生额',
+        '发生额（分）': '发生额',
+        '发生额(分)': '发生额',
+        '交易日期': '交易日期',
+        '业务日期': '交易日期',
+        '发生日期': '交易日期',
+        '来源日期': '交易日期',
+        '支付日期': '交易日期',
+        '日期': '交易日期',
+        '入账日期': '交易日期',
+        '入帐日期': '交易日期',
+    }
+    rename_map = {}
+    for col in df.columns:
+        clean_col = str(col).strip()
+        if clean_col.startswith('\ufeff'):
+            clean_col = clean_col[1:]
+        if clean_col in alias_map:
+            rename_map[col] = alias_map[clean_col]
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    required_cols = ['交易日期', '付款人名称', '付款人账号', '凭证类型', '支付金额', '发生额']
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"确认文件 {filepath} 缺少必需列: {', '.join(missing_cols)}；"
+            f"当前列名: {list(df.columns)}"
+        )
+
+    df['日期对象'] = df['交易日期'].apply(_parse_confirm_date)
+    df = df.dropna(subset=['日期对象'])
+    df['付款人名称'] = df['付款人名称'].map(_normalize_confirm_text_value)
+    df['付款人账号'] = df['付款人账号'].map(_normalize_confirm_account_value)
+    df['凭证类型'] = df['凭证类型'].map(_normalize_confirm_code_value)
+    df['支付金额'] = _normalize_confirm_numeric_series(df['支付金额'])
+    df['发生额'] = _normalize_confirm_numeric_series(df['发生额'])
+
+    expected_fen = -(df['支付金额'] * 100).round()
+    valid_amount = (
+        df['支付金额'].notna()
+        & df['发生额'].notna()
+        & ((df['发生额'] - expected_fen).abs() < 0.01)
+    )
+    return df.loc[valid_amount].sort_values('日期对象').reset_index(drop=True)
+
+
+def confirm_settlement_suspicious(suspicious_df, confirm_file_path):
+    """
+    对清算核查可疑记录做二次确认。
+
+    以可疑记录来源日期为基准，检查当天或下一工作日内是否存在：
+    - 付款人名称 = 来账对方户名
+    - 付款人账号 = 对方账号
+    - 凭证类型 = 2302
+    - 支付金额 × 100 取负数后 = 该条记录的发生额
+
+    找到的记录从可疑结果中剔除；找不到则保留。确认 CSV 中的每条 2302 记录
+    最多用于剔除一条可疑记录，避免重复使用同一笔确认数据。
+    """
+    if suspicious_df is None or len(suspicious_df) == 0:
+        return suspicious_df.copy() if suspicious_df is not None else pd.DataFrame()
+    if not confirm_file_path:
+        return suspicious_df.copy()
+
+    required_cols = ['来源日期', '对方账号', '来账对方户名']
+    missing_cols = [c for c in required_cols if c not in suspicious_df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"清算核查结果缺少二次确认所需列: {', '.join(missing_cols)}"
+        )
+
+    confirm_df = _load_settlement_confirm_csv(confirm_file_path)
+    if len(confirm_df) == 0:
+        print(f"[清算核查二次确认] 确认文件中无有效 2302 记录，保留全部 {len(suspicious_df)} 条")
+        return suspicious_df.copy()
+
+    by_key = {}
+    for idx, row in confirm_df.iterrows():
+        key = (row['日期对象'].date(), row['付款人名称'], row['付款人账号'], row['凭证类型'])
+        by_key.setdefault(key, []).append(idx)
+
+    matched_confirm = set()
+    kept = []
+    removed = 0
+    for _, row in suspicious_df.iterrows():
+        source_date = _parse_confirm_date(row['来源日期'])
+        if source_date is None:
+            kept.append(row.to_dict())
+            continue
+
+        name = _normalize_confirm_text_value(row['来账对方户名'])
+        account = _normalize_confirm_account_value(row['对方账号'])
+        confirm_dates = {source_date.date(), next_workday(source_date).date()}
+
+        found = False
+        for d in confirm_dates:
+            for confirm_idx in by_key.get((d, name, account, '2302'), []):
+                if confirm_idx not in matched_confirm:
+                    matched_confirm.add(confirm_idx)
+                    found = True
+                    break
+            if found:
+                break
+
+        if found:
+            removed += 1
+        else:
+            kept.append(row.to_dict())
+
+    result_df = pd.DataFrame(kept, columns=suspicious_df.columns)
+    print(
+        f"[清算核查二次确认] 可疑记录 {len(suspicious_df)} 条，"
+        f"确认剔除 {removed} 条，保留 {len(result_df)} 条"
+    )
+    return result_df
+
+
+# =========================
 # 清算核查简化版：仅输出可疑记录）
 # =========================
 
@@ -1549,6 +1755,7 @@ def detect_settlement_verification(
     file_path: str,
     designated_account = '待报解预算收入',
     days_threshold: int = 2,
+    confirm_file_path: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     清算核查：按退款笔数核对待查资金与匹配资金。
@@ -1573,6 +1780,8 @@ def detect_settlement_verification(
         默认 "待报解预算收入"
     days_threshold : int
         工作日阈值（默认 2）。待查资金超过此工作日未退回 → 标记"违规"
+    confirm_file_path : str, optional
+        二次确认 CSV 文件路径。提供时，会按 2302 凭证记录剔除已确认的可疑记录。
 
     返回
     -------
@@ -1713,10 +1922,10 @@ def detect_settlement_verification(
     # ================================================================
     df = df.sort_values('时间对象').reset_index(drop=True)
 
-    # 提取列为 NumPy 数组遍历，避免 to_dict/iterrows 的开销
-    amounts = df['交易金额'].values
-    dates = df['日期对象'].values
-    dts = df['时间对象'].values
+    # 提取列为 Python 列表遍历，避免 to_dict/iterrows 的开销
+    amounts = df['交易金额'].tolist()
+    dates = df['日期对象'].tolist()
+    dts = df['时间对象'].tolist()
     counterparties = (
         df['对方户名'].fillna('').astype(str).str.strip().values
         if '对方户名' in df.columns else [''] * len(df)
@@ -1823,21 +2032,20 @@ def detect_settlement_verification(
 
         # ── 日期切换时输出进度 ──
         if i == 0 or date != dates[i - 1] if i > 0 else True:
-            date_str = pd.Timestamp(date).strftime('%Y-%m-%d')
+            date_str = date.strftime('%Y-%m-%d')
             print(f"[清算核查] 处理 {date_str} 待查池:{sum(active)} 已退回:{len(matched)} 超期:{len(expired)}")
 
-        # 先处理已超期的待查资金，转为 Python datetime 给后续使用
-        py_date = pd.Timestamp(date).to_pydatetime()
-        _expire_overdue(py_date)
+        # 先处理已超期的待查资金
+        _expire_overdue(date)
 
         if amount > 0:
             # ── 待查资金：非指定账户汇入 → 入队 ──
             if counterparty in designated_accounts:
                 continue
             ci = len(credits)
-            deadline = add_working_days(py_date, days_threshold)
+            deadline = add_working_days(date, days_threshold)
             credits.append({
-                'date': py_date, 'datetime': dt, 'amount': round(amount, 2),
+                'date': date, 'datetime': dt, 'amount': round(amount, 2),
                 'counterparty': counterparty,
                 'summary': summaries[i],
                 'deadline': deadline, 'row_idx': i,
@@ -1855,7 +2063,10 @@ def detect_settlement_verification(
             debit_amt = round(abs(amount), 2)
 
             remarks = remarks_col[i] or summaries[i]
-            m = re.search(r'(?:退|共)?\s*(\d+)\s*笔', remarks)
+            # 优先匹配"授权支付退款共xx笔"，再回退到通用模式
+            m = re.search(r'共\s*(\d+)\s*笔', remarks)
+            if not m:
+                m = re.search(r'(?:退|共)?\s*(\d+)\s*笔', remarks)
             batch_n = int(m.group(1)) if m else None
 
             # 二分查找定位匹配资金时间点之前的待查资金
@@ -1872,7 +2083,7 @@ def detect_settlement_verification(
                     # 附言笔数 < 剩余笔数，按金额匹配找出具体 N 笔
                     print(
                         f"[清算核查] 条数({len(eligible)}) > 笔数({batch_n})，需金额匹配: "
-                        f"{py_date.strftime('%Y-%m-%d')} {pd.Timestamp(dt).strftime('%H:%M:%S')} "
+                        f"{date.strftime('%Y-%m-%d')} {dt.strftime('%H:%M:%S')} "
                         f"金额:{debit_amt}"
                     )
                     eligible_items = [credits[ci] for ci in eligible]
@@ -1902,7 +2113,7 @@ def detect_settlement_verification(
 
     # 数据遍历结束后，以最后日期为界再检查一次超期待查资金
     if len(df) > 0:
-        last_date = pd.Timestamp(df['日期对象'].max()).to_pydatetime()
+        last_date = df['日期对象'].max()
         _expire_overdue(last_date)
 
     # ── 按日期输出汇总 ──
@@ -1958,6 +2169,9 @@ def detect_settlement_verification(
         results_df = results_df.sort_values('来源日期', ascending=False).reset_index(drop=True)
 
     print(f"[清算核查] 待查:{len(credits)} 已退回:{len(matched)} 违规:{len(results_df)}")
+
+    if confirm_file_path and len(results_df) > 0:
+        results_df = confirm_settlement_suspicious(results_df, confirm_file_path)
 
     return results_df
 
