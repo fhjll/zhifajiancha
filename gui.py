@@ -107,10 +107,10 @@ class App(ctk.CTk):
         self.non_tax_account_name = ctk.StringVar(value="待报解预算收入")
         self.non_tax_days = ctk.StringVar(value="2")
 
-        # 清算核查
+        # 清算退款确认
         self.settlement_check_file = ctk.StringVar(value="")
         self.settlement_check_account = ctk.StringVar(value="待报解预算收入")
-        self.settlement_check_days = ctk.StringVar(value="1")
+        self.settlement_check_days = ctk.StringVar(value="2")
         self.settlement_confirm_file = ctk.StringVar(value="")
 
         # ── 流水预处理 ──
@@ -323,12 +323,12 @@ class App(ctk.CTk):
         self.run_btn.grid(row=r, column=0, columnspan=3, sticky="ew", padx=12, pady=(8, 12))
         r += 1
 
-        # ── 清算核查（仅输出可疑记录） ──
+        # ── 清算退款确认（逐笔匹配） ──
         ctk.CTkLabel(tab, text="",
                      font=ctk.CTkFont(size=1)).grid(row=r, column=0, columnspan=3)
         r += 1
 
-        ctk.CTkLabel(tab, text="🔍 清算核查（仅输出可疑记录）",
+        ctk.CTkLabel(tab, text="🔍 清算退款确认（逐笔匹配确认CSV）",
                      font=ctk.CTkFont(size=14, weight="bold")
                      ).grid(row=r, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=(12, 0))
         r += 1
@@ -352,37 +352,27 @@ class App(ctk.CTk):
         row_f.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(row_f, text="确认CSV", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
         ctk.CTkEntry(row_f, textvariable=self.settlement_confirm_file,
-                     placeholder_text="可选：2302凭证二次确认文件...").grid(
+                     placeholder_text="必选：凭证类型编号2302确认文件...").grid(
             row=0, column=1, sticky="ew", padx=(0, 8))
         ctk.CTkButton(row_f, text="浏览", width=64,
                        command=lambda: self._browse_file(self.settlement_confirm_file)
                        ).grid(row=0, column=2, padx=(0, 6))
         r += 1
 
-        # 指定账户名称
+        # 匹配窗口
         row_f = ctk.CTkFrame(tab, fg_color="transparent")
         row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
-        row_f.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(row_f, text="划转账户", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
-        ctk.CTkEntry(row_f, textvariable=self.settlement_check_account,
-                     placeholder_text="多账户用逗号分隔，如: 待报解预算收入,国库经收处").grid(
-            row=0, column=1, columnspan=2, sticky="ew", padx=(0, 6))
-        r += 1
-
-        # 阈值天数
-        row_f = ctk.CTkFrame(tab, fg_color="transparent")
-        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
-        ctk.CTkLabel(row_f, text="阈值天数", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkLabel(row_f, text="窗口工作日", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
         ctk.CTkEntry(row_f, textvariable=self.settlement_check_days, width=60).grid(
             row=0, column=1, sticky="w")
-        ctk.CTkLabel(row_f, text="超过此工作日数未划转即标记为可疑（跳过周末）",
+        ctk.CTkLabel(row_f, text="两个工作日内未匹配即视为可疑（跳过节假日）",
                      text_color="gray", font=ctk.CTkFont(size=11)).grid(
             row=0, column=2, sticky="w")
         r += 1
 
         # 运行按钮
         self.run_sc_btn = ctk.CTkButton(
-            tab, text="▶  清算核查",
+            tab, text="▶  清算退款确认",
             font=ctk.CTkFont(size=15, weight="bold"),
             height=38, corner_radius=8,
             command=self._run_settlement_check,
@@ -1110,7 +1100,7 @@ class App(ctk.CTk):
         self._log_step("═══════════════════════════════")
         self._log_success("非税核查完成！")
 
-    # ──────────── 清算核查（仅输出可疑记录） ────────────
+    # ──────────── 清算退款确认（逐笔匹配） ────────────
 
     def _run_settlement_check(self):
         if self.running_sc:
@@ -1131,22 +1121,24 @@ class App(ctk.CTk):
         try:
             self._run_settlement_check_internal()
         except Exception as e:
-            self._log_error(f"清算核查出错: {e}")
+            self._log_error(f"清算退款确认出错: {e}")
             import traceback
             self._log_error(traceback.format_exc())
         finally:
             self.running_sc = False
             self.after(0, lambda: self.run_sc_btn.configure(
-                text="▶  清算核查", state="normal"))
+                text="▶  清算退款确认", state="normal"))
 
     def _run_settlement_check_internal(self):
         file_path = self.settlement_check_file.get().strip()
         confirm_path = self.settlement_confirm_file.get().strip()
-        if confirm_path and not os.path.exists(confirm_path):
-            self._log_error(f"二次确认CSV不存在: {confirm_path}")
+        if not confirm_path:
+            self._log_error("清算退款确认需要选择确认CSV")
+            return
+        if not os.path.exists(confirm_path):
+            self._log_error(f"确认CSV不存在: {confirm_path}")
             return
 
-        account_name = self.settlement_check_account.get().strip() or "待报解预算收入"
         try:
             threshold = int(self.settlement_check_days.get())
         except ValueError:
@@ -1155,23 +1147,21 @@ class App(ctk.CTk):
         out_dir = self.output_dir.get()
         os.makedirs(out_dir, exist_ok=True)
 
-        self._log_step("═══ 清算核查：仅输出可疑记录 ═══")
+        self._log_step("═══ 清算退款确认：逐笔匹配 ═══")
         self._log_result(f"  流水文件: {file_path}")
-        self._log_result(f"  确认CSV: {confirm_path or '未启用'}")
-        self._log_result(f"  划转账户: {account_name}")
-        self._log_result(f"  阈值天数: {threshold}")
+        self._log_result(f"  确认CSV: {confirm_path}")
+        self._log_result(f"  窗口工作日: {threshold}")
 
         results = detect_settlement_verification(
             file_path=file_path,
-            designated_account=_parse_multi_account(account_name),
             days_threshold=threshold,
-            confirm_file_path=confirm_path or None,
+            confirm_file_path=confirm_path,
         )
 
         output_path = os.path.join(out_dir, "清算核查结果.xlsx")
 
         if len(results) == 0:
-            self._log_success("未发现可疑记录（所有来账后均有划转）")
+            self._log_success("未发现可疑记录（所有退款均在窗口内确认）")
             # 仍然保存空结果文件
             pd.DataFrame(columns=['文件来源', '账号', '来源日期', '来源金额', '摘要',
                                   '对方账号', '来账对方户名', '窗口截止', '窗口工作日', '状态']
@@ -1187,7 +1177,7 @@ class App(ctk.CTk):
 
         self._log_success(f"清算核查结果已保存: {output_path}")
         self._log_step("═══════════════════════════════")
-        self._log_success("清算核查完成！")
+        self._log_success("清算退款确认完成！")
 
     # ──────────── 文书生成 ────────────
 
