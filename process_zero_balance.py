@@ -1282,6 +1282,210 @@ def detect_delayed_settlement(
 
 
 # =========================
+# 非税核查：暂收款按日截止 + FIFO 模式
+# =========================
+
+_ZHANKUAN_COUNTERPARTIES = {'暂收款', '待报解预算收入'}
+
+
+def _parse_non_tax_time(df):
+    """解析非税核查新模式所需的时间列，缺失或无法解析时报错。"""
+    time_col = None
+    for c in ('入帐时间', '入账时间', '交易时间', '时间'):
+        if c in df.columns:
+            time_col = c
+            break
+    if time_col is None:
+        raise ValueError("非税核查新模式需要入帐时间/入账时间/交易时间/时间列")
+
+    time_str = (
+        df[time_col].astype(str)
+        .str.strip()
+        .str.replace('.', ':', regex=False)
+        .str.replace('：', ':', regex=False)
+    )
+    time_parsed = pd.to_datetime(time_str, format='%H:%M:%S', errors='coerce')
+    mask = time_parsed.isna()
+    for fmt in ('%H:%M', '%H%M%S', '%H%M'):
+        if not mask.any():
+            break
+        time_parsed.loc[mask] = pd.to_datetime(time_str[mask], format=fmt, errors='coerce')
+        mask = time_parsed.isna()
+
+    seconds = (
+        time_parsed.dt.hour.fillna(0) * 3600
+        + time_parsed.dt.minute.fillna(0) * 60
+        + time_parsed.dt.second.fillna(0)
+    )
+    df['时间对象'] = df['日期对象'] + pd.to_timedelta(seconds, unit='s')
+
+    numeric_mask = time_parsed.isna() & pd.api.types.is_numeric_dtype(df[time_col])
+    if numeric_mask.any():
+        frac = pd.to_numeric(df.loc[numeric_mask, time_col], errors='coerce')
+        valid = frac.between(0, 1)
+        if valid.any():
+            idx = frac[valid].index
+            df.loc[idx, '时间对象'] = df.loc[idx, '日期对象'] + pd.to_timedelta(
+                (frac[valid] * 86400).round(), unit='s'
+            )
+            time_parsed.loc[idx] = pd.Timestamp('2000-01-01')
+
+    if df['时间对象'].isna().any() or time_parsed.isna().any():
+        bad_rows = df.index[df['时间对象'].isna() | time_parsed.isna()].tolist()[:10]
+        raise ValueError(f"非税核查新模式存在无法解析的入帐时间，行号: {bad_rows}")
+
+    return df
+
+
+def _is_debit_flag(value):
+    """判断借贷标志是否为 1，兼容 1 / '1' / '借'。"""
+    if pd.isna(value):
+        return False
+    try:
+        if float(value) == 1:
+            return True
+    except (ValueError, TypeError):
+        pass
+    return str(value).strip() in ('1', '借')
+
+
+def _get_balance_value(row, balance_col):
+    """读取余额，缺失或无法解析时返回 None，按非零处理。"""
+    if balance_col is None:
+        return None
+    value = row.get(balance_col)
+    if pd.isna(value):
+        return None
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _detect_non_tax_zhankuan_mode(
+    df,
+    file_label,
+    account_num,
+    days_threshold,
+):
+    """暂收款/待报解预算收入按日截止 + FIFO 模式，仅输出超过两个工作日仍未处理的来账。"""
+    if '借贷标志' not in df.columns:
+        raise ValueError("非税核查新模式需要借贷标志列")
+
+    balance_col = None
+    for c in ('账户余额', '余额'):
+        if c in df.columns:
+            balance_col = c
+            break
+
+    df = _parse_non_tax_time(df)
+    df = df.sort_values('时间对象').reset_index(drop=True)
+    latest_date = df['日期对象'].max()
+
+    # 每个日期最后一笔暂收款/待报解预算收入支出
+    last_zhankuan = {}
+    for idx, row in df.iterrows():
+        counterparty = str(row.get('对方户名', '') or '').strip()
+        if _is_debit_flag(row.get('借贷标志')) and counterparty in _ZHANKUAN_COUNTERPARTIES:
+            last_zhankuan[row['日期对象'].date()] = idx
+
+    last_zhankuan_zero = {}
+    for day, idx in last_zhankuan.items():
+        row = df.loc[idx]
+        bal = _get_balance_value(row, balance_col)
+        last_zhankuan_zero[day] = (bal is not None and abs(bal) < 0.005)
+
+    pending = []
+    results = []
+
+    def _clear_pending():
+        pending.clear()
+
+    def _fifo_consume(amount):
+        remaining = abs(float(amount))
+        while remaining > 0.005 and pending:
+            oldest = pending[0]
+            take = min(remaining, oldest['remaining'])
+            oldest['remaining'] -= take
+            remaining -= take
+            if oldest['remaining'] < 0.005:
+                pending.pop(0)
+
+    for idx, row in df.iterrows():
+        amount = row.get('交易金额', 0)
+        if pd.isna(amount) or amount == 0:
+            continue
+
+        if amount > 0:
+            cpty_acct = ''
+            for c in ('对方账号', '对方帐号'):
+                v = row.get(c)
+                if pd.notna(v):
+                    cpty_acct = _normalize_confirm_account_value(v)
+                    break
+            pending.append({
+                'date': row['日期对象'],
+                'amount': float(amount),
+                'remaining': float(amount),
+                'summary': str(row.get('摘要', '') or ''),
+                'counterparty': str(row.get('对方户名', '') or ''),
+                'counterparty_acct': cpty_acct,
+            })
+            continue
+
+        counterparty = str(row.get('对方户名', '') or '').strip()
+        if not (_is_debit_flag(row.get('借贷标志')) and counterparty in _ZHANKUAN_COUNTERPARTIES):
+            continue
+
+        day = row['日期对象'].date()
+        bal = _get_balance_value(row, balance_col)
+        is_zero = (bal is not None and abs(bal) < 0.005)
+
+        if last_zhankuan_zero.get(day, False):
+            # 当天最后一笔暂收款/待报解预算收入余额为 0：只在最后一笔处清空，不执行 FIFO
+            if last_zhankuan.get(day) == idx:
+                _clear_pending()
+            continue
+
+        if is_zero:
+            _clear_pending()
+        else:
+            _fifo_consume(amount)
+
+    for item in pending:
+        wdays = working_days_between(item['date'], latest_date)
+        if wdays > days_threshold:
+            results.append({
+                '文件来源': file_label,
+                '账号': account_num,
+                '来源日期': item['date'].strftime('%Y-%m-%d'),
+                '来源金额': item['amount'],
+                '摘要': item['summary'],
+                '对方账号': item['counterparty_acct'],
+                '来账对方户名': item['counterparty'],
+                '划转日期': '',
+                '划转金额': 0,
+                '划转对方行名': '',
+                '等待工作日': wdays,
+                '阈值天数': days_threshold,
+                '备注': '未处理',
+                '状态': '可疑',
+            })
+
+    columns = [
+        '文件来源', '账号', '来源日期', '来源金额', '摘要',
+        '对方账号', '来账对方户名', '划转日期', '划转金额',
+        '划转对方行名', '等待工作日', '阈值天数', '备注', '状态',
+    ]
+    results_df = pd.DataFrame(results, columns=columns)
+    if len(results_df) > 0:
+        results_df = results_df.sort_values(
+            ['等待工作日', '来源日期'], ascending=[False, True]
+        ).reset_index(drop=True)
+    return results_df
+
+
+# =========================
 # 非税核查
 # =========================
 
@@ -1289,9 +1493,13 @@ def detect_non_tax_verification(
     file_path='非税专户.csv',
     designated_account: str = '待报解预算收入',
     days_threshold: int = 2,
+    mode: str = 'zhankuan',
 ) -> pd.DataFrame:
     """
-    非税专户核查（v2）：累计滚动匹配 + 余额归零检测。
+    非税专户核查。
+
+    mode='zhankuan'：暂收款按日截止 + FIFO 模式（默认）。
+    mode='fifo'：原 FIFO 累计匹配 + 余额归零检测。
 
     核心规则（v2 优化）：
     - FIFO 累计匹配：不再要求 1:1 精确金额，采用先入先出累计匹配
@@ -1394,6 +1602,19 @@ def detect_non_tax_verification(
             balance_col = c
             df[balance_col] = pd.to_numeric(df[balance_col], errors='coerce')
             break
+
+    # ================================================================
+    # 1.5 新模式：暂收款按日截止 + FIFO
+    # ================================================================
+    if mode == 'zhankuan':
+        return _detect_non_tax_zhankuan_mode(
+            df=df,
+            file_label=file_label,
+            account_num=account_num,
+            days_threshold=days_threshold,
+        )
+    if mode != 'fifo':
+        raise ValueError("非税核查 mode 仅支持 zhankuan 或 fifo")
 
     # ================================================================
     # 2. 数据准备：按时间顺序遍历，构建来账列表与 FIFO 匹配
