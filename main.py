@@ -163,47 +163,56 @@ def run_pipeline(
         nt_file = non_tax_file or zero_balance_path
         nt_account = non_tax_account or advance_acct_name
 
-        nt_results = detect_non_tax_verification(
-            file_path=nt_file,
-            designated_account=nt_account,
-            days_threshold=non_tax_days,
-        )
+        if os.path.isdir(nt_file):
+            flow_files = sorted([
+                os.path.join(nt_file, name)
+                for name in os.listdir(nt_file)
+                if os.path.splitext(name)[1].lower() in ('.csv', '.txt', '.xlsx', '.xls')
+            ])
+        else:
+            flow_files = [nt_file]
 
-        nt_output = os.path.join(output_dir, "非税核查结果.xlsx")
-        # 仅保存有问题的记录（延迟划转/未划转/可疑）+ 末尾汇总行
-        # 仅保存不正常的记录（排除已划转和汇总行），去掉备注列
-        nt_save = nt_results[
-            (nt_results['状态'] != '已划转') &
-            (nt_results['来源日期'] != '--- 合计 ---')
-        ].reset_index(drop=True)
-        if '备注' in nt_save.columns:
-            nt_save = nt_save.drop(columns=['备注'])
-        nt_save.to_excel(nt_output, index=False)
+        if not flow_files:
+            print("  文件夹中没有流水文件", file=sys.stderr)
+            return
 
-        suspicious = nt_results[nt_results['状态'] == '可疑']
-        pending = nt_results[nt_results['状态'].isin(['未划转'])]
-        delayed = nt_results[nt_results['状态'] == '延迟划转']
-        zb_cleared = nt_results[nt_results['备注'].str.contains('余额归零', na=False)] if '备注' in nt_results.columns else pd.DataFrame()
-        split_transfers = nt_results[nt_results['备注'].str.contains('分批划转', na=False)] if '备注' in nt_results.columns else pd.DataFrame()
-        print(f"  来账总数: {len(nt_results)}")
-        print(f"  可疑（超{non_tax_days}工作日未划转）: {len(suspicious)}")
-        print(f"  未划转（在途）: {len(pending)}")
-        print(f"  延迟划转: {len(delayed)}")
-        if len(zb_cleared) > 0:
-            print(f"  余额归零: {len(zb_cleared)}")
-        if len(split_transfers) > 0:
-            print(f"  分批划转: {len(split_transfers)}")
-        if len(nt_results) > 0:
-            summary = nt_results.iloc[-1]
-            print(f"  流入合计: {summary['来源金额']}")
-            print(f"  已匹配合计: {summary['划转金额']}")
-            if '来源金额' in summary and '划转金额' in summary:
-                try:
-                    unmatched = float(summary['来源金额']) - float(summary['划转金额'])
-                    print(f"  未匹配合计: {unmatched:.2f}")
-                except (ValueError, TypeError):
-                    pass
-        print(f"  结果已保存: {nt_output}")
+        for f in flow_files:
+            print(f"  正在核查: {f}")
+            nt_results = detect_non_tax_verification(
+                file_path=f,
+                designated_account=nt_account,
+                days_threshold=non_tax_days,
+            )
+
+            stem = os.path.splitext(os.path.basename(f))[0]
+            if len(flow_files) > 1:
+                nt_output = os.path.join(output_dir, f"{stem}_非税核查结果.xlsx")
+            else:
+                nt_output = os.path.join(output_dir, "非税核查结果.xlsx")
+
+            # 仅保存有问题的记录（延迟划转/未划转/可疑），去掉备注列
+            nt_save = nt_results[
+                (nt_results['状态'] != '已划转') &
+                (nt_results['来源日期'] != '--- 合计 ---')
+            ].reset_index(drop=True)
+            if '备注' in nt_save.columns:
+                nt_save = nt_save.drop(columns=['备注'])
+            nt_save.to_excel(nt_output, index=False)
+
+            suspicious = nt_results[nt_results['状态'] == '可疑']
+            pending = nt_results[nt_results['状态'].isin(['未划转'])]
+            delayed = nt_results[nt_results['状态'] == '延迟划转']
+            zb_cleared = nt_results[nt_results['备注'].str.contains('余额归零', na=False)] if '备注' in nt_results.columns else pd.DataFrame()
+            split_transfers = nt_results[nt_results['备注'].str.contains('分批划转', na=False)] if '备注' in nt_results.columns else pd.DataFrame()
+            print(f"  {stem}: 来账总数 {len(nt_results)}")
+            print(f"  {stem}: 可疑（超{non_tax_days}工作日未划转） {len(suspicious)}")
+            print(f"  {stem}: 未划转（在途） {len(pending)}")
+            print(f"  {stem}: 延迟划转 {len(delayed)}")
+            if len(zb_cleared) > 0:
+                print(f"  {stem}: 余额归零 {len(zb_cleared)}")
+            if len(split_transfers) > 0:
+                print(f"  {stem}: 分批划转 {len(split_transfers)}")
+            print(f"  结果已保存: {nt_output}")
 
     # ========== 步骤5（可选）: 清算退款确认（逐笔匹配确认CSV） ==========
     if settlement_check:
@@ -296,7 +305,7 @@ def main():
     parser.add_argument(
         "--non-tax-file",
         default="",
-        help="非税核查的流水文件路径（默认同 --zero-balance）",
+        help="非税核查的流水文件或文件夹路径（默认同 --zero-balance）",
     )
     parser.add_argument(
         "--non-tax-account",
