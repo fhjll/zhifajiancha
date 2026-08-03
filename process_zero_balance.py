@@ -1368,7 +1368,7 @@ def _detect_non_tax_zhankuan_mode(
     account_num,
     days_threshold,
 ):
-    """暂收款/待报解预算收入按日截止 + FIFO 模式，仅输出超过两个工作日仍未处理的来账。"""
+    """暂收款/待报解预算收入按日截止 + FIFO 模式；超期记入可疑但保留在队列，后续处理时回填划转日期。"""
     if '借贷标志' not in df.columns:
         raise ValueError("非税核查新模式需要借贷标志列")
 
@@ -1380,7 +1380,6 @@ def _detect_non_tax_zhankuan_mode(
 
     df = _parse_non_tax_time(df)
     df = df.sort_values('时间对象').reset_index(drop=True)
-    latest_date = df['日期对象'].max()
 
     # 每个日期最后一笔暂收款/待报解预算收入支出
     last_zhankuan = {}
@@ -1398,10 +1397,18 @@ def _detect_non_tax_zhankuan_mode(
     pending = []
     results = []
 
-    def _clear_pending():
+    def _mark_removed(item, current_date, matched_amount):
+        if item['suspicious_result'] is not None:
+            item['suspicious_result']['划转日期'] = current_date.strftime('%Y-%m-%d')
+            item['suspicious_result']['划转金额'] = matched_amount
+            item['suspicious_result']['备注'] = '后续已划转'
+
+    def _clear_pending(current_date):
+        for item in pending:
+            _mark_removed(item, current_date, item['amount'])
         pending.clear()
 
-    def _fifo_consume(amount):
+    def _fifo_consume(amount, current_date):
         remaining = abs(float(amount))
         while remaining > 0.005 and pending:
             oldest = pending[0]
@@ -1409,11 +1416,37 @@ def _detect_non_tax_zhankuan_mode(
             oldest['remaining'] -= take
             remaining -= take
             if oldest['remaining'] < 0.005:
+                _mark_removed(oldest, current_date, take)
                 pending.pop(0)
+
+    def _expire_pending(current_date):
+        for item in pending:
+            wdays = working_days_between(item['date'], current_date)
+            if not item['suspicious_recorded'] and wdays > days_threshold:
+                item['suspicious_recorded'] = True
+                item['suspicious_result'] = {
+                    '文件来源': file_label,
+                    '账号': account_num,
+                    '来源日期': item['date'].strftime('%Y-%m-%d'),
+                    '来源金额': item['amount'],
+                    '摘要': item['summary'],
+                    '对方账号': item['counterparty_acct'],
+                    '来账对方户名': item['counterparty'],
+                    '划转日期': '',
+                    '划转金额': 0,
+                    '划转对方行名': '',
+                    '等待工作日': wdays,
+                    '阈值天数': days_threshold,
+                    '备注': '未处理',
+                    '状态': '可疑',
+                }
+                results.append(item['suspicious_result'])
 
     for idx, row in df.iterrows():
         amount = row.get('交易金额', 0)
+        current_date = row['日期对象']
         if pd.isna(amount) or amount == 0:
+            _expire_pending(current_date)
             continue
 
         if amount > 0:
@@ -1430,47 +1463,26 @@ def _detect_non_tax_zhankuan_mode(
                 'summary': str(row.get('摘要', '') or ''),
                 'counterparty': str(row.get('对方户名', '') or ''),
                 'counterparty_acct': cpty_acct,
+                'suspicious_recorded': False,
+                'suspicious_result': None,
             })
-            continue
-
-        counterparty = str(row.get('对方户名', '') or '').strip()
-        if not (_is_debit_flag(row.get('借贷标志')) and counterparty in _ZHANKUAN_COUNTERPARTIES):
-            continue
-
-        day = row['日期对象'].date()
-        bal = _get_balance_value(row, balance_col)
-        is_zero = (bal is not None and abs(bal) < 0.005)
-
-        if last_zhankuan_zero.get(day, False):
-            # 当天最后一笔暂收款/待报解预算收入余额为 0：只在最后一笔处清空，不执行 FIFO
-            if last_zhankuan.get(day) == idx:
-                _clear_pending()
-            continue
-
-        if is_zero:
-            _clear_pending()
         else:
-            _fifo_consume(amount)
+            counterparty = str(row.get('对方户名', '') or '').strip()
+            if _is_debit_flag(row.get('借贷标志')) and counterparty in _ZHANKUAN_COUNTERPARTIES:
+                day = row['日期对象'].date()
+                bal = _get_balance_value(row, balance_col)
+                is_zero = (bal is not None and abs(bal) < 0.005)
 
-    for item in pending:
-        wdays = working_days_between(item['date'], latest_date)
-        if wdays > days_threshold:
-            results.append({
-                '文件来源': file_label,
-                '账号': account_num,
-                '来源日期': item['date'].strftime('%Y-%m-%d'),
-                '来源金额': item['amount'],
-                '摘要': item['summary'],
-                '对方账号': item['counterparty_acct'],
-                '来账对方户名': item['counterparty'],
-                '划转日期': '',
-                '划转金额': 0,
-                '划转对方行名': '',
-                '等待工作日': wdays,
-                '阈值天数': days_threshold,
-                '备注': '未处理',
-                '状态': '可疑',
-            })
+                if last_zhankuan_zero.get(day, False):
+                    # 当天最后一笔同类记录余额为 0：只在最后一笔处清空，不执行 FIFO
+                    if last_zhankuan.get(day) == idx:
+                        _clear_pending(current_date)
+                elif is_zero:
+                    _clear_pending(current_date)
+                else:
+                    _fifo_consume(amount, current_date)
+
+        _expire_pending(current_date)
 
     columns = [
         '文件来源', '账号', '来源日期', '来源金额', '摘要',
