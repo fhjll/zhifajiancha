@@ -18,7 +18,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-from process_zero_balance import detect_fund_matching, detect_non_tax_verification, detect_settlement_verification
+from process_zero_balance import detect_fund_matching, detect_non_tax_verification, detect_settlement_refund_matching
 from generate_report import batch_generate
 from logger import setup_logging, TeeWriter, get_log_path
 
@@ -215,30 +215,36 @@ def run_pipeline(
         print("步骤: 清算退款确认（逐笔匹配确认CSV）")
         print("=" * 50)
 
-        sc_results = detect_settlement_verification(
+        sc_results = detect_settlement_refund_matching(
             file_path=settlement_check,
             designated_account=settlement_account,
             days_threshold=settlement_days,
             confirm_file_path=settlement_confirm,
         )
 
-        sc_output = os.path.join(output_dir, "清算核查结果.xlsx")
+        sc_base = os.path.join(output_dir, os.path.splitext(os.path.basename(settlement_check))[0])
+        overdue_path = f"{sc_base}_超期匹配.xlsx"
+        unmatched_path = f"{sc_base}_未匹配.xlsx"
+        overdue_df = sc_results.get('overdue', pd.DataFrame())
+        unmatched_df = sc_results.get('unmatched', pd.DataFrame())
+        result_columns = [
+            '文件来源', '账号', '来源日期', '来源金额', '摘要',
+            '对方账号', '来账对方户名', '匹配日期', '匹配金额',
+            '窗口截止', '窗口工作日', '状态',
+        ]
         print(f"  确认CSV: {settlement_confirm}")
         print(f"  目标账户: {settlement_account}")
-        if len(sc_results) == 0:
-            print("  未发现可疑记录（所有退款均在窗口内确认）")
-            pd.DataFrame(columns=[
-                '文件来源', '账号', '来源日期', '来源金额', '摘要',
-                '对方账号', '来账对方户名', '窗口截止', '窗口工作日', '状态'
-            ]).to_excel(sc_output, index=False)
-        else:
-            sc_results.to_excel(sc_output, index=False)
-            print(f"  可疑记录数: {len(sc_results)}")
-            for _, row in sc_results.iterrows():
-                print(f"    {row['来源日期']} | 金额:{row['来源金额']} | "
-                      f"来账方:{row['来账对方户名']} | "
-                      f"窗口截止:{row['窗口截止']}")
-        print(f"  结果已保存: {sc_output}")
+        print(f"  窗口内匹配: {sc_results.get('matched', 0)}")
+        pd.DataFrame(overdue_df if len(overdue_df) else None, columns=result_columns).to_excel(
+            overdue_path, index=False
+        )
+        pd.DataFrame(unmatched_df if len(unmatched_df) else None, columns=result_columns).to_excel(
+            unmatched_path, index=False
+        )
+        print(f"  超期匹配记录数: {len(overdue_df)}")
+        print(f"  未匹配记录数: {len(unmatched_df)}")
+        print(f"  超期匹配结果已保存: {overdue_path}")
+        print(f"  未匹配结果已保存: {unmatched_path}")
 
     print()
     print("=" * 50)
