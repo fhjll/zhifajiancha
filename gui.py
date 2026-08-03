@@ -109,6 +109,7 @@ class App(ctk.CTk):
         self.settlement_check_file = ctk.StringVar(value="")
         self.settlement_check_account = ctk.StringVar(value="待报解预算收入")
         self.settlement_check_days = ctk.StringVar(value="2")
+        self.settlement_confirm_file = ctk.StringVar(value="")
 
         # ── 流水预处理 ──
         self.preprocess_input_path = ctk.StringVar(value="")
@@ -338,6 +339,19 @@ class App(ctk.CTk):
             row=0, column=1, sticky="ew", padx=(0, 8))
         ctk.CTkButton(row_f, text="浏览", width=64,
                        command=lambda: self._browse_file(self.settlement_check_file)
+                       ).grid(row=0, column=2, padx=(0, 6))
+        r += 1
+
+        # 二次确认 CSV
+        row_f = ctk.CTkFrame(tab, fg_color="transparent")
+        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
+        row_f.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(row_f, text="确认CSV", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkEntry(row_f, textvariable=self.settlement_confirm_file,
+                     placeholder_text="可选：2302凭证二次确认文件...").grid(
+            row=0, column=1, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(row_f, text="浏览", width=64,
+                       command=lambda: self._browse_file(self.settlement_confirm_file)
                        ).grid(row=0, column=2, padx=(0, 6))
         r += 1
 
@@ -1123,6 +1137,11 @@ class App(ctk.CTk):
 
     def _run_settlement_check_internal(self):
         file_path = self.settlement_check_file.get().strip()
+        confirm_path = self.settlement_confirm_file.get().strip()
+        if confirm_path and not os.path.exists(confirm_path):
+            self._log_error(f"二次确认CSV不存在: {confirm_path}")
+            return
+
         account_name = self.settlement_check_account.get().strip() or "待报解预算收入"
         try:
             threshold = int(self.settlement_check_days.get())
@@ -1134,6 +1153,7 @@ class App(ctk.CTk):
 
         self._log_step("═══ 清算核查：仅输出可疑记录 ═══")
         self._log_result(f"  流水文件: {file_path}")
+        self._log_result(f"  确认CSV: {confirm_path or '未启用'}")
         self._log_result(f"  划转账户: {account_name}")
         self._log_result(f"  阈值天数: {threshold}")
 
@@ -1141,6 +1161,7 @@ class App(ctk.CTk):
             file_path=file_path,
             designated_account=_parse_multi_account(account_name),
             days_threshold=threshold,
+            confirm_file_path=confirm_path or None,
         )
 
         output_path = os.path.join(out_dir, "清算核查结果.xlsx")
