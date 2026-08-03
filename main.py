@@ -78,7 +78,7 @@ def run_pipeline(
     non_tax_days=2,
     settlement_check=None,
     settlement_account="待报解预算收入",
-    settlement_days=2,
+    settlement_days=1,
     settlement_confirm=None,
     max_workers=1,
 ):
@@ -313,8 +313,8 @@ def main():
     parser.add_argument(
         "--settlement-days",
         type=int,
-        default=2,
-        help="清算核查未划转阈值天数 (默认: 2)",
+        default=1,
+        help="清算核查未划转阈值天数 (默认: 1)",
     )
     parser.add_argument(
         "--settlement-confirm",
