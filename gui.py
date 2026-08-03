@@ -106,6 +106,7 @@ class App(ctk.CTk):
         self.non_tax_file_path = ctk.StringVar(value="零余额账户.xlsx")
         self.non_tax_account_name = ctk.StringVar(value="待报解预算收入")
         self.non_tax_days = ctk.StringVar(value="2")
+        self.non_tax_mode = ctk.StringVar(value="zhankuan")
 
         # 清算退款确认
         self.settlement_check_file = ctk.StringVar(value="")
@@ -419,6 +420,24 @@ class App(ctk.CTk):
                        ).grid(row=0, column=3, padx=(0, 6))
         r += 1
 
+        # 核查模式
+        row_f = ctk.CTkFrame(tab, fg_color="transparent")
+        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
+        ctk.CTkLabel(row_f, text="核查模式", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        mode_f = ctk.CTkFrame(row_f, fg_color="transparent")
+        mode_f.grid(row=0, column=1, columnspan=2, sticky="w")
+        ctk.CTkRadioButton(
+            mode_f, text="暂收款/待报解按日截止 + FIFO",
+            variable=self.non_tax_mode, value="zhankuan",
+            command=self._on_non_tax_mode_change,
+        ).pack(side="left", padx=(0, 16))
+        ctk.CTkRadioButton(
+            mode_f, text="原FIFO累计匹配",
+            variable=self.non_tax_mode, value="fifo",
+            command=self._on_non_tax_mode_change,
+        ).pack(side="left")
+        r += 1
+
         # Section: 核查参数
         ctk.CTkLabel(tab, text="⚙️ 核查参数",
                      font=ctk.CTkFont(size=14, weight="bold")
@@ -430,8 +449,9 @@ class App(ctk.CTk):
         row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
         row_f.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(row_f, text="划转账户", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
-        ctk.CTkEntry(row_f, textvariable=self.non_tax_account_name).grid(
-            row=0, column=1, columnspan=2, sticky="ew", padx=(0, 6))
+        self.non_tax_account_entry = ctk.CTkEntry(row_f, textvariable=self.non_tax_account_name)
+        self.non_tax_account_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(0, 6))
+        self._on_non_tax_mode_change()
         row_f = ctk.CTkFrame(tab, fg_color="transparent")
         row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 4), padx=(6, 6))
         ctk.CTkLabel(row_f, text="", width=LW).grid(row=0, column=0, padx=(6, 8))
@@ -797,6 +817,11 @@ class App(ctk.CTk):
         if path:
             var.set(path)
 
+    def _on_non_tax_mode_change(self):
+        if hasattr(self, 'non_tax_account_entry'):
+            state = 'normal' if self.non_tax_mode.get() == 'fifo' else 'disabled'
+            self.non_tax_account_entry.configure(state=state)
+
     # ──────────── LLM 配置菜单 ────────────
 
     @property
@@ -1069,6 +1094,7 @@ class App(ctk.CTk):
 
         self._log_step("═══ 非税收入：滚动匹配划转核查 ═══")
         self._log_result(f"  流水文件/文件夹: {file_path}")
+        self._log_result(f"  核查模式: {'暂收款/待报解按日截止+FIFO' if self.non_tax_mode.get() == 'zhankuan' else '原FIFO'}")
         self._log_result(f"  指定账户: {account_name}")
         self._log_result(f"  阈值天数: {threshold}")
 
@@ -1091,6 +1117,7 @@ class App(ctk.CTk):
                 file_path=f,
                 designated_account=account_name,
                 days_threshold=threshold,
+                mode=self.non_tax_mode.get(),
             )
 
             stem = os.path.splitext(os.path.basename(f))[0]
