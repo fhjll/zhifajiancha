@@ -1650,19 +1650,22 @@ def _normalize_confirm_code_value(value):
     return str(value).strip()
 
 
-def _normalize_confirm_numeric_series(series):
-    """将 CSV 金额列转换为数值，兼容千分位和人民币符号。"""
-    if pd.api.types.is_numeric_dtype(series):
-        return pd.to_numeric(series, errors='coerce')
+def _normalize_confirm_amount_value(value):
+    """将单个金额值转为数值，兼容千分位和人民币符号。"""
+    if pd.isna(value):
+        return None
     cleaned = (
-        series.astype(str)
-        .str.replace(',', '', regex=False)
-        .str.replace('，', '', regex=False)
-        .str.replace('￥', '', regex=False)
-        .str.replace('元', '', regex=False)
-        .str.strip()
+        str(value)
+        .replace(',', '')
+        .replace('，', '')
+        .replace('￥', '')
+        .replace('元', '')
+        .strip()
     )
-    return pd.to_numeric(cleaned, errors='coerce')
+    try:
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return None
 
 
 def _parse_confirm_date(value):
@@ -1680,7 +1683,7 @@ def _parse_confirm_date(value):
 
 
 def _load_settlement_confirm_csv(filepath):
-    """加载二次确认 CSV，并仅保留符合 2302 金额换算规则的记录。"""
+    """加载二次确认 CSV，保留凭证类型编号为 2302 的记录。"""
     if not _is_csv_file(filepath):
         raise ValueError(f"二次确认数据需为 CSV 文件: {filepath}")
 
@@ -1694,14 +1697,16 @@ def _load_settlement_confirm_csv(filepath):
         '付款人姓名': '付款人名称',
         '付款人账号': '付款人账号',
         '付款人帐号': '付款人账号',
-        '凭证类型': '凭证类型',
-        '票据类型': '凭证类型',
+        '凭证类型': '凭证类型编号',
+        '凭证类型编号': '凭证类型编号',
+        '票据类型': '凭证类型编号',
         '支付金额': '支付金额',
         '付款金额': '支付金额',
         '发生额': '发生额',
         '发生金额': '发生额',
         '发生额（分）': '发生额',
         '发生额(分)': '发生额',
+        '凭证日期': '交易日期',
         '交易日期': '交易日期',
         '业务日期': '交易日期',
         '发生日期': '交易日期',
@@ -1721,7 +1726,10 @@ def _load_settlement_confirm_csv(filepath):
     if rename_map:
         df = df.rename(columns=rename_map)
 
-    required_cols = ['交易日期', '付款人名称', '付款人账号', '凭证类型', '支付金额', '发生额']
+    if '发生额' not in df.columns and '支付金额' in df.columns:
+        df['发生额'] = df['支付金额']
+
+    required_cols = ['交易日期', '付款人名称', '付款人账号', '凭证类型编号', '发生额']
     missing_cols = [c for c in required_cols if c not in df.columns]
     if missing_cols:
         raise ValueError(
@@ -1733,17 +1741,11 @@ def _load_settlement_confirm_csv(filepath):
     df = df.dropna(subset=['日期对象'])
     df['付款人名称'] = df['付款人名称'].map(_normalize_confirm_text_value)
     df['付款人账号'] = df['付款人账号'].map(_normalize_confirm_account_value)
-    df['凭证类型'] = df['凭证类型'].map(_normalize_confirm_code_value)
-    df['支付金额'] = _normalize_confirm_numeric_series(df['支付金额'])
-    df['发生额'] = _normalize_confirm_numeric_series(df['发生额'])
-
-    expected_fen = -(df['支付金额'] * 100).round()
-    valid_amount = (
-        df['支付金额'].notna()
-        & df['发生额'].notna()
-        & ((df['发生额'] - expected_fen).abs() < 0.01)
-    )
-    return df.loc[valid_amount].sort_values('日期对象').reset_index(drop=True)
+    df['凭证类型编号'] = df['凭证类型编号'].map(_normalize_confirm_code_value)
+    df['发生额'] = df['发生额'].map(_normalize_confirm_amount_value)
+    df = df.loc[df['凭证类型编号'] == '2302'].copy()
+    df = df.dropna(subset=['发生额'])
+    return df.sort_values('日期对象').reset_index(drop=True)
 
 
 def confirm_settlement_suspicious(suspicious_df, confirm_file_path):
@@ -1753,8 +1755,8 @@ def confirm_settlement_suspicious(suspicious_df, confirm_file_path):
     以可疑记录来源日期为基准，检查当天或下一工作日内是否存在：
     - 付款人名称 = 来账对方户名
     - 付款人账号 = 对方账号
-    - 凭证类型 = 2302
-    - 支付金额 × 100 取负数后 = 该条记录的发生额
+    - 凭证类型编号 = 2302
+    - 确认 CSV 发生额（对应支付金额）与可疑记录来源金额一致
 
     找到的记录从可疑结果中剔除；找不到则保留。确认 CSV 中的每条 2302 记录
     最多用于剔除一条可疑记录，避免重复使用同一笔确认数据。
@@ -1764,7 +1766,7 @@ def confirm_settlement_suspicious(suspicious_df, confirm_file_path):
     if not confirm_file_path:
         return suspicious_df.copy()
 
-    required_cols = ['来源日期', '对方账号', '来账对方户名']
+    required_cols = ['来源日期', '来源金额', '对方账号', '来账对方户名']
     missing_cols = [c for c in required_cols if c not in suspicious_df.columns]
     if missing_cols:
         raise ValueError(
@@ -1778,8 +1780,8 @@ def confirm_settlement_suspicious(suspicious_df, confirm_file_path):
 
     by_key = {}
     for idx, row in confirm_df.iterrows():
-        key = (row['日期对象'].date(), row['付款人名称'], row['付款人账号'], row['凭证类型'])
-        by_key.setdefault(key, []).append(idx)
+        key = (row['日期对象'].date(), row['付款人名称'], row['付款人账号'])
+        by_key.setdefault(key, []).append((idx, row['发生额']))
 
     matched_confirm = set()
     kept = []
@@ -1792,12 +1794,18 @@ def confirm_settlement_suspicious(suspicious_df, confirm_file_path):
 
         name = _normalize_confirm_text_value(row['来账对方户名'])
         account = _normalize_confirm_account_value(row['对方账号'])
+        source_amount = _normalize_confirm_amount_value(row['来源金额'])
         confirm_dates = {source_date.date(), next_workday(source_date).date()}
 
         found = False
         for d in confirm_dates:
-            for confirm_idx in by_key.get((d, name, account, '2302'), []):
-                if confirm_idx not in matched_confirm:
+            for confirm_idx, confirm_amount in by_key.get((d, name, account), []):
+                if (
+                    confirm_idx not in matched_confirm
+                    and confirm_amount is not None
+                    and source_amount is not None
+                    and round(abs(confirm_amount) * 100) == round(abs(source_amount) * 100)
+                ):
                     matched_confirm.add(confirm_idx)
                     found = True
                     break
@@ -1851,7 +1859,7 @@ def detect_settlement_verification(
     days_threshold : int
         工作日阈值（默认 1）。待查资金超过此工作日未退回 → 标记"违规"
     confirm_file_path : str, optional
-        二次确认 CSV 文件路径。提供时，会按 2302 凭证记录剔除已确认的可疑记录。
+        二次确认 CSV 文件路径。提供时，会按凭证类型编号 2302 的记录剔除已确认的可疑记录。
 
     返回
     -------
