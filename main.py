@@ -78,7 +78,7 @@ def run_pipeline(
     non_tax_days=2,
     settlement_check=None,
     settlement_account="待报解预算收入",
-    settlement_days=1,
+    settlement_days=2,
     settlement_confirm=None,
     max_workers=1,
 ):
@@ -205,11 +205,14 @@ def run_pipeline(
                     pass
         print(f"  结果已保存: {nt_output}")
 
-    # ========== 步骤5（可选）: 清算核查（仅输出可疑记录） ==========
+    # ========== 步骤5（可选）: 清算退款确认（逐笔匹配确认CSV） ==========
     if settlement_check:
+        if not settlement_confirm:
+            print("错误: 启用清算退款确认时必须提供确认CSV文件路径", file=sys.stderr)
+            return
         print()
         print("=" * 50)
-        print("步骤: 清算核查（仅输出可疑记录）")
+        print("步骤: 清算退款确认（逐笔匹配确认CSV）")
         print("=" * 50)
 
         sc_results = detect_settlement_verification(
@@ -220,10 +223,9 @@ def run_pipeline(
         )
 
         sc_output = os.path.join(output_dir, "清算核查结果.xlsx")
-        if settlement_confirm:
-            print(f"  二次确认CSV: {settlement_confirm}")
+        print(f"  确认CSV: {settlement_confirm}")
         if len(sc_results) == 0:
-            print("  未发现可疑记录（所有来账后均有划转）")
+            print("  未发现可疑记录（所有退款均在窗口内确认）")
             pd.DataFrame(columns=[
                 '文件来源', '账号', '来源日期', '来源金额', '摘要',
                 '对方账号', '来账对方户名', '窗口截止', '窗口工作日', '状态'
@@ -303,23 +305,23 @@ def main():
     parser.add_argument(
         "--settlement-check",
         default="",
-        help="启用清算核查，指定流水文件路径（仅输出可疑记录）",
+        help="启用清算退款确认，指定流水文件路径",
     )
     parser.add_argument(
         "--settlement-account",
         default="待报解预算收入",
-        help="清算核查的指定划转账户名称，多个用逗号分隔 (默认: 待报解预算收入)",
+        help="兼容参数，新清算退款确认逻辑不再使用",
     )
     parser.add_argument(
         "--settlement-days",
         type=int,
-        default=1,
-        help="清算核查未划转阈值天数 (默认: 1)",
+        default=2,
+        help="清算退款确认匹配窗口工作日数 (默认: 2)",
     )
     parser.add_argument(
         "--settlement-confirm",
         default="",
-        help="清算核查二次确认 CSV 文件路径（可选，2302 凭证确认）",
+        help="清算退款确认 CSV 文件路径（必填，凭证类型编号 2302）",
     )
     parser.add_argument(
         "--output-dir",
@@ -364,6 +366,10 @@ def main():
         if not os.path.exists(path):
             print(f"错误: {name} 不存在: {path}", file=sys.stderr)
             sys.exit(1)
+
+    if args.settlement_check and not args.settlement_confirm:
+        print("错误: 启用清算退款确认时必须提供 --settlement-confirm", file=sys.stderr)
+        sys.exit(1)
 
     if args.from_results:
         # 直接由结果文件生成文书
