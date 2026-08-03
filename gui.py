@@ -89,8 +89,10 @@ class App(ctk.CTk):
         setup_logging()
 
         self.title(self.TITLE)
-        self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
-        self.minsize(700, 700)
+        screen_height = self.winfo_screenheight()
+        safe_height = max(560, screen_height - 60)
+        self.geometry(f"{self.WIDTH}x{min(self.HEIGHT, safe_height)}")
+        self.minsize(700, 560)
 
         # ── 状态变量 ──
         # 清算退款
@@ -108,7 +110,7 @@ class App(ctk.CTk):
         # 清算核查
         self.settlement_check_file = ctk.StringVar(value="")
         self.settlement_check_account = ctk.StringVar(value="待报解预算收入")
-        self.settlement_check_days = ctk.StringVar(value="2")
+        self.settlement_check_days = ctk.StringVar(value="1")
         self.settlement_confirm_file = ctk.StringVar(value="")
 
         # ── 流水预处理 ──
@@ -190,7 +192,7 @@ class App(ctk.CTk):
         # ── 三标签页 ──
         self.tabview = ctk.CTkTabview(self, corner_radius=10)
         self.tabview.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 8))
-        self.grid_rowconfigure(1, weight=0)  # 不伸缩
+        self.grid_rowconfigure(1, weight=1)  # 标签页区域可伸缩
 
         self.tab_clear = self.tabview.add("清算退款")
         self.tab_non_tax = self.tabview.add("非税收入")
@@ -242,7 +244,9 @@ class App(ctk.CTk):
     # ── 标签页1: 清算退款 ──
 
     def _build_tab_clear(self):
-        tab = self.tab_clear
+        scroll = ctk.CTkScrollableFrame(self.tab_clear, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=4, pady=4)
+        tab = scroll
         LW = self.LABEL_W
         tab.grid_columnconfigure(1, weight=1)
 
