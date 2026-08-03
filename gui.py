@@ -359,6 +359,16 @@ class App(ctk.CTk):
                        ).grid(row=0, column=2, padx=(0, 6))
         r += 1
 
+        # 目标账户
+        row_f = ctk.CTkFrame(tab, fg_color="transparent")
+        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
+        row_f.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(row_f, text="目标账户", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkEntry(row_f, textvariable=self.settlement_check_account,
+                     placeholder_text="多账户用逗号分隔，如: 待报解预算收入,国库经收处").grid(
+            row=0, column=1, columnspan=2, sticky="ew", padx=(0, 6))
+        r += 1
+
         # 匹配窗口
         row_f = ctk.CTkFrame(tab, fg_color="transparent")
         row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
@@ -1150,10 +1160,13 @@ class App(ctk.CTk):
         self._log_step("═══ 清算退款确认：逐笔匹配 ═══")
         self._log_result(f"  流水文件: {file_path}")
         self._log_result(f"  确认CSV: {confirm_path}")
+        account_name = self.settlement_check_account.get().strip() or "待报解预算收入"
+        self._log_result(f"  目标账户: {account_name}")
         self._log_result(f"  窗口工作日: {threshold}")
 
         results = detect_settlement_verification(
             file_path=file_path,
+            designated_account=_parse_multi_account(account_name),
             days_threshold=threshold,
             confirm_file_path=confirm_path,
         )
