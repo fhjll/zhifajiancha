@@ -1756,7 +1756,7 @@ def confirm_settlement_suspicious(suspicious_df, confirm_file_path):
     - 付款人名称 = 来账对方户名
     - 付款人账号 = 对方账号
     - 凭证类型编号 = 2302
-    - 确认 CSV 发生额（对应支付金额）与可疑记录来源金额一致
+    - 确认 CSV 发生额（对应支付金额）× 100 后取绝对值，等于可疑记录来源金额的绝对值
 
     找到的记录从可疑结果中剔除；找不到则保留。确认 CSV 中的每条 2302 记录
     最多用于剔除一条可疑记录，避免重复使用同一笔确认数据。
@@ -1804,7 +1804,7 @@ def confirm_settlement_suspicious(suspicious_df, confirm_file_path):
                     confirm_idx not in matched_confirm
                     and confirm_amount is not None
                     and source_amount is not None
-                    and round(abs(confirm_amount) * 100) == round(abs(source_amount) * 100)
+                    and round(abs(confirm_amount * 100)) == round(abs(source_amount))
                 ):
                     matched_confirm.add(confirm_idx)
                     found = True
@@ -1825,11 +1825,174 @@ def confirm_settlement_suspicious(suspicious_df, confirm_file_path):
     return result_df
 
 
-# =========================
-# 清算核查简化版：仅输出可疑记录）
-# =========================
+def _load_settlement_refund_records(file_path):
+    """加载流水文件中的退款记录（金额大于 0 的交易）。"""
+    if _is_csv_file(file_path):
+        _, df = _load_dataframe(file_path)
+        if len(df) == 0:
+            return [], '', ''
+        df = _normalize_csv_columns(df, convert_fen=False)
+        date_col = None
+        for c in ['交易日期', '入帐日期', '入账日期']:
+            if c in df.columns:
+                date_col = c
+                break
+        if date_col is None:
+            return [], '', ''
+        df = df.dropna(subset=[date_col])
+        df['日期对象'] = df[date_col].apply(_parse_confirm_date)
+        df = df.dropna(subset=['日期对象'])
+        if '交易金额' in df.columns:
+            df['交易金额'] = pd.to_numeric(df['交易金额'], errors='coerce')
+        elif '发生额' in df.columns:
+            df['交易金额'] = pd.to_numeric(df['发生额'], errors='coerce')
+        df = _normalize_amount_vectorized(df)
+        if '对方户名' not in df.columns or df['对方户名'].isna().all():
+            df['对方户名'] = df.get('对方行名', '')
+        if '摘要' not in df.columns:
+            df['摘要'] = df.get('附言', '')
+    else:
+        _, df = _load_dataframe(file_path)
+        if len(df) == 0:
+            return [], '', ''
+        df = _normalize_csv_columns(df, convert_fen=False)
+        date_col = None
+        for c in ['交易日期', '入帐日期', '入账日期']:
+            if c in df.columns:
+                date_col = c
+                break
+        if date_col is None:
+            return [], '', ''
+        df = df.dropna(subset=[date_col])
+        df['日期对象'] = df[date_col].apply(_parse_confirm_date)
+        df = df.dropna(subset=['日期对象'])
+        if '交易金额' in df.columns:
+            df['交易金额'] = pd.to_numeric(df['交易金额'], errors='coerce')
+        elif '发生额' in df.columns:
+            df['交易金额'] = pd.to_numeric(df['发生额'], errors='coerce')
+        df = _normalize_amount_vectorized(df)
+        if '对方户名' not in df.columns or df['对方户名'].isna().all():
+            df['对方户名'] = df.get('对方行名', '')
+        if '摘要' not in df.columns:
+            df['摘要'] = ''
+
+    file_label = os.path.splitext(os.path.basename(file_path))[0]
+    account_num = ''
+    for c in ('账号', '帐号'):
+        if c in df.columns and len(df) > 0:
+            v = df[c].iloc[0]
+            if pd.notna(v):
+                account_num = _normalize_confirm_account_value(v)
+                break
+
+    acct_col = None
+    for c in ('对方账号', '对方帐号'):
+        if c in df.columns:
+            acct_col = c
+            break
+
+    refunds = []
+    for _, row in df.iterrows():
+        amount = row.get('交易金额', 0)
+        if pd.isna(amount) or amount <= 0:
+            continue
+        cpty_acct = ''
+        if acct_col:
+            cpty_acct = _normalize_confirm_account_value(row[acct_col])
+        refunds.append({
+            'date': row['日期对象'],
+            'amount': round(float(amount), 2),
+            'counterparty': _normalize_confirm_text_value(row.get('对方户名')),
+            'account': cpty_acct,
+            'summary': str(row.get('摘要', '') or '').strip(),
+        })
+
+    return refunds, file_label, account_num
+
 
 def detect_settlement_verification(
+    file_path: str,
+    designated_account = '待报解预算收入',
+    days_threshold: int = 2,
+    confirm_file_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    清算退款确认：对流水文件中的每一笔退款，逐笔匹配确认 CSV。
+
+    匹配规则：
+    - 确认 CSV 凭证日期在来源日期起的 days_threshold 个工作日内
+    - 付款人名称 = 来账对方户名
+    - 付款人账号 = 对方账号
+    - 凭证类型编号 = 2302
+    - abs(确认 CSV 发生额 × 100) == abs(来源金额)
+
+    在窗口内找不到匹配记录时，该笔退款视为可疑记录。
+    """
+    if not confirm_file_path:
+        raise ValueError("清算退款确认必须提供确认 CSV 文件路径")
+
+    confirm_df = _load_settlement_confirm_csv(confirm_file_path)
+    by_key = {}
+    for idx, row in confirm_df.iterrows():
+        key = (row['日期对象'].date(), row['付款人名称'], row['付款人账号'])
+        by_key.setdefault(key, []).append((idx, row['发生额']))
+
+    refunds, file_label, account_num = _load_settlement_refund_records(file_path)
+    matched_confirm = set()
+    results = []
+
+    for refund in refunds:
+        source_date = refund['date']
+        end_date = add_working_days(source_date, days_threshold)
+        current = source_date
+        found = False
+
+        while current <= end_date:
+            d = current.date() if isinstance(current, datetime) else current
+            for confirm_idx, confirm_amount in by_key.get((d, refund['counterparty'], refund['account']), []):
+                if (
+                    confirm_idx not in matched_confirm
+                    and confirm_amount is not None
+                    and refund['amount'] is not None
+                    and round(abs(confirm_amount * 100)) == round(abs(refund['amount']))
+                ):
+                    matched_confirm.add(confirm_idx)
+                    found = True
+                    break
+            if found:
+                break
+            current += timedelta(days=1)
+
+        if not found:
+            results.append({
+                '文件来源': file_label,
+                '账号': account_num,
+                '来源日期': source_date.strftime('%Y-%m-%d'),
+                '来源金额': refund['amount'],
+                '摘要': refund['summary'],
+                '对方账号': refund['account'],
+                '来账对方户名': refund['counterparty'],
+                '窗口截止': end_date.strftime('%Y-%m-%d'),
+                '窗口工作日': days_threshold,
+                '状态': '可疑',
+            })
+
+    results_df = pd.DataFrame(results)
+    if len(results_df) > 0:
+        results_df = results_df.sort_values('来源日期', ascending=False).reset_index(drop=True)
+
+    print(
+        f"[清算退款确认] 退款:{len(refunds)} 已确认:{len(matched_confirm)} "
+        f"可疑:{len(results_df)}"
+    )
+    return results_df
+
+
+# =========================
+# 旧版清算核查（保留兼容，不再由 GUI/CLI 调用）
+# =========================
+
+def _detect_settlement_verification_legacy(
     file_path: str,
     designated_account = '待报解预算收入',
     days_threshold: int = 1,
