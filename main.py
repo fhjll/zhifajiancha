@@ -76,6 +76,7 @@ def run_pipeline(
     non_tax_file=None,
     non_tax_account=None,
     non_tax_days=2,
+    non_tax_mode='zhankuan',
     settlement_check=None,
     settlement_account="待报解预算收入",
     settlement_days=2,
@@ -178,10 +179,12 @@ def run_pipeline(
 
         for f in flow_files:
             print(f"  正在核查: {f}")
+            print(f"  核查模式: {non_tax_mode}")
             nt_results = detect_non_tax_verification(
                 file_path=f,
                 designated_account=nt_account,
                 days_threshold=non_tax_days,
+                mode=non_tax_mode,
             )
 
             stem = os.path.splitext(os.path.basename(f))[0]
@@ -319,6 +322,12 @@ def main():
         help="非税核查未划转阈值天数 (默认: 2)",
     )
     parser.add_argument(
+        "--non-tax-mode",
+        choices=["zhankuan", "fifo"],
+        default="zhankuan",
+        help="非税核查模式: zhankuan=暂收款/待报解预算收入按日截止+FIFO, fifo=原FIFO累计匹配 (默认: zhankuan)",
+    )
+    parser.add_argument(
         "--settlement-check",
         default="",
         help="启用清算退款确认，指定流水文件路径",
@@ -425,6 +434,7 @@ def main():
         non_tax_file=args.non_tax_file or None,
         non_tax_account=args.non_tax_account or None,
         non_tax_days=args.non_tax_days,
+        non_tax_mode=args.non_tax_mode,
         settlement_check=args.settlement_check or None,
         settlement_account=settlement_account_list or args.settlement_account,
         settlement_days=args.settlement_days,
