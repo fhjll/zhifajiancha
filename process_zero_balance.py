@@ -1285,7 +1285,12 @@ def detect_delayed_settlement(
 # 非税核查：暂收款按日截止 + FIFO 模式
 # =========================
 
-_ZHANKUAN_COUNTERPARTIES = {'暂收款', '待报解预算收入'}
+_ZHANKUAN_KEYWORDS = ('暂收款', '待报解预算收入')
+
+
+def _is_zhankuan_counterparty(counterparty):
+    """对方户名包含“暂收款”或“待报解预算收入”时视为暂收款类账户。"""
+    return any(keyword in counterparty for keyword in _ZHANKUAN_KEYWORDS)
 
 
 def _parse_non_tax_time(df):
@@ -1385,7 +1390,7 @@ def _detect_non_tax_zhankuan_mode(
     last_zhankuan = {}
     for idx, row in df.iterrows():
         counterparty = str(row.get('对方户名', '') or '').strip()
-        if _is_debit_flag(row.get('借贷标志')) and counterparty in _ZHANKUAN_COUNTERPARTIES:
+        if _is_debit_flag(row.get('借贷标志')) and _is_zhankuan_counterparty(counterparty):
             last_zhankuan[row['日期对象'].date()] = idx
 
     last_zhankuan_zero = {}
@@ -1442,11 +1447,24 @@ def _detect_non_tax_zhankuan_mode(
                 }
                 results.append(item['suspicious_result'])
 
+    def _log_debit(row, current_date, action):
+        remaining_count = len(pending)
+        remaining_amount = sum(item['remaining'] for item in pending)
+        counterparty = str(row.get('对方户名', '') or '').strip()
+        amount = abs(float(row.get('交易金额', 0)))
+        time_str = current_date.strftime('%Y-%m-%d %H:%M:%S')
+        print(
+            f"[非税核查] {time_str} 出账 对方户名:{counterparty} "
+            f"金额:{amount:.2f} 动作:{action} "
+            f"当前未匹配记录数:{remaining_count} "
+            f"当前未匹配金额:{remaining_amount:.2f}"
+        )
+
     for idx, row in df.iterrows():
         amount = row.get('交易金额', 0)
-        current_date = row['日期对象']
+        current_time = row['时间对象']
         if pd.isna(amount) or amount == 0:
-            _expire_pending(current_date)
+            _expire_pending(current_time)
             continue
 
         if amount > 0:
@@ -1468,21 +1486,28 @@ def _detect_non_tax_zhankuan_mode(
             })
         else:
             counterparty = str(row.get('对方户名', '') or '').strip()
-            if _is_debit_flag(row.get('借贷标志')) and counterparty in _ZHANKUAN_COUNTERPARTIES:
+            if _is_debit_flag(row.get('借贷标志')):
                 day = row['日期对象'].date()
                 bal = _get_balance_value(row, balance_col)
                 is_zero = (bal is not None and abs(bal) < 0.005)
 
-                if last_zhankuan_zero.get(day, False):
+                if not _is_zhankuan_counterparty(counterparty):
+                    _log_debit(row, current_time, '不参与匹配')
+                elif last_zhankuan_zero.get(day, False):
                     # 当天最后一笔同类记录余额为 0：只在最后一笔处清空，不执行 FIFO
                     if last_zhankuan.get(day) == idx:
-                        _clear_pending(current_date)
+                        _clear_pending(current_time)
+                        _log_debit(row, current_time, '余额归零清零')
+                    else:
+                        _log_debit(row, current_time, '跳过FIFO(当日最后同类余额0)')
                 elif is_zero:
-                    _clear_pending(current_date)
+                    _clear_pending(current_time)
+                    _log_debit(row, current_time, '余额归零清零')
                 else:
-                    _fifo_consume(amount, current_date)
+                    _fifo_consume(amount, current_time)
+                    _log_debit(row, current_time, 'FIFO匹配')
 
-        _expire_pending(current_date)
+        _expire_pending(current_time)
 
     columns = [
         '文件来源', '账号', '来源日期', '来源金额', '摘要',
