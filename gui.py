@@ -113,6 +113,7 @@ class App(ctk.CTk):
         self.settlement_check_account = ctk.StringVar(value="待报解预算收入")
         self.settlement_check_days = ctk.StringVar(value="2")
         self.settlement_confirm_file = ctk.StringVar(value="")
+        self.settlement_zero_balance_path = ctk.StringVar(value="")
 
         # ── 流水预处理 ──
         self.preprocess_input_path = ctk.StringVar(value="")
@@ -357,6 +358,19 @@ class App(ctk.CTk):
             row=0, column=1, sticky="ew", padx=(0, 8))
         ctk.CTkButton(row_f, text="浏览", width=64,
                        command=lambda: self._browse_file(self.settlement_confirm_file)
+                       ).grid(row=0, column=2, padx=(0, 6))
+        r += 1
+
+        # 零余额账户流水文件夹
+        row_f = ctk.CTkFrame(tab, fg_color="transparent")
+        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
+        row_f.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(row_f, text="零余额账户", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkEntry(row_f, textvariable=self.settlement_zero_balance_path,
+                     placeholder_text="可选：文件名以账号命名的零余额账户流水文件夹...").grid(
+            row=0, column=1, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(row_f, text="目录", width=64,
+                       command=lambda: self._browse_directory(self.settlement_zero_balance_path)
                        ).grid(row=0, column=2, padx=(0, 6))
         r += 1
 
@@ -1192,6 +1206,10 @@ class App(ctk.CTk):
         if not os.path.exists(confirm_path):
             self._log_error(f"确认CSV不存在: {confirm_path}")
             return
+        zero_balance_path = self.settlement_zero_balance_path.get().strip()
+        if zero_balance_path and not os.path.exists(zero_balance_path):
+            self._log_error(f"零余额账户流水文件夹不存在: {zero_balance_path}")
+            return
 
         try:
             threshold = int(self.settlement_check_days.get())
@@ -1204,6 +1222,7 @@ class App(ctk.CTk):
         self._log_step("═══ 清算退款确认：逐笔匹配 ═══")
         self._log_result(f"  流水文件: {file_path}")
         self._log_result(f"  确认CSV: {confirm_path}")
+        self._log_result(f"  零余额账户流水: {zero_balance_path or '未提供'}")
         account_name = self.settlement_check_account.get().strip() or "待报解预算收入"
         self._log_result(f"  目标账户: {account_name}")
         self._log_result(f"  窗口工作日: {threshold}")
@@ -1213,6 +1232,7 @@ class App(ctk.CTk):
             designated_account=_parse_multi_account(account_name),
             days_threshold=threshold,
             confirm_file_path=confirm_path,
+            zero_balance_file_path=zero_balance_path or None,
         )
 
         base_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -1220,16 +1240,21 @@ class App(ctk.CTk):
         unmatched_path = os.path.join(out_dir, f"{base_name}_未匹配.xlsx")
         overdue_df = results.get('overdue', pd.DataFrame())
         unmatched_df = results.get('unmatched', pd.DataFrame())
-        result_columns = [
+        overdue_columns = [
+            '文件来源', '账号', '来源日期', '来源金额', '摘要',
+            '对方账号', '来账对方户名', '匹配日期', '匹配金额',
+            '窗口截止', '窗口工作日', '状态', '清算日期',
+        ]
+        unmatched_columns = [
             '文件来源', '账号', '来源日期', '来源金额', '摘要',
             '对方账号', '来账对方户名', '匹配日期', '匹配金额',
             '窗口截止', '窗口工作日', '状态',
         ]
 
-        pd.DataFrame(overdue_df if len(overdue_df) else None, columns=result_columns).to_excel(
+        pd.DataFrame(overdue_df if len(overdue_df) else None, columns=overdue_columns).to_excel(
             overdue_path, index=False
         )
-        pd.DataFrame(unmatched_df if len(unmatched_df) else None, columns=result_columns).to_excel(
+        pd.DataFrame(unmatched_df if len(unmatched_df) else None, columns=unmatched_columns).to_excel(
             unmatched_path, index=False
         )
         self._log_result(f"  窗口内匹配: {results.get('matched', 0)}")
