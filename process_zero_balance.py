@@ -2138,6 +2138,155 @@ def _fill_settlement_clearing_date(overdue_df, clearing_by_party):
     return overdue_df
 
 
+def _load_overdue_result_file(filepath):
+    """读取超期匹配结果文件，并兼容旧/新列名。"""
+    _, df = _load_dataframe(filepath)
+    if len(df) == 0:
+        return pd.DataFrame()
+
+    source_col = '退至垫款户日期' if '退至垫款户日期' in df.columns else '来源日期'
+    match_col = '退至国库日期' if '退至国库日期' in df.columns else '匹配日期'
+    if source_col not in df.columns or match_col not in df.columns:
+        return pd.DataFrame()
+
+    df['来源日期'] = df[source_col].apply(_parse_confirm_date)
+    df['匹配日期'] = df[match_col].apply(_parse_confirm_date)
+    if '来源金额' not in df.columns:
+        df['来源金额'] = np.nan
+    if '对方账号' not in df.columns:
+        df['对方账号'] = ''
+    if '来账对方户名' not in df.columns:
+        df['来账对方户名'] = ''
+    if '匹配金额' not in df.columns:
+        df['匹配金额'] = np.nan
+    return df
+
+
+def detect_interval_anomalies_from_overdue_folder(
+    confirm_file_path,
+    overdue_folder,
+    output_path=None,
+):
+    """
+    从确认 CSV 重新匹配 2301 清算日期，遍历超期匹配结果文件，
+    汇总日期间隔大于 1 个工作日的记录。
+    """
+    confirm_2302 = _load_settlement_confirm_csv(confirm_file_path, voucher_code='2302')
+    confirm_2301 = _load_settlement_confirm_csv(confirm_file_path, voucher_code='2301')
+
+    by_2302 = {}
+    for _, row in confirm_2302.iterrows():
+        key = (row['付款人名称'], row['付款人账号'])
+        by_2302.setdefault(key, []).append({
+            'date': row['日期对象'].date(),
+            'amount': row['发生额'],
+            'receiver_name': row['收款人名称'],
+            'receiver_acct': row['收款人账号'],
+            'summary': row['摘要'],
+        })
+
+    by_2301 = {}
+    for _, row in confirm_2301.iterrows():
+        key = (row['付款人名称'], row['付款人账号'])
+        by_2301.setdefault(key, []).append({
+            'date': row['日期对象'].date(),
+            'amount': row['发生额'],
+            'receiver_name': row['收款人名称'],
+            'receiver_acct': row['收款人账号'],
+            'summary': row['摘要'],
+        })
+
+    exts = ('.csv', '.txt', '.xlsx', '.xls')
+    overdue_files = sorted(
+        os.path.join(overdue_folder, name)
+        for name in os.listdir(overdue_folder)
+        if os.path.splitext(name)[1].lower() in exts
+        and name.lower().endswith(('_超期匹配.csv', '_超期匹配.txt', '_超期匹配.xlsx', '_超期匹配.xls'))
+    )
+
+    results = []
+    for filepath in overdue_files:
+        df = _load_overdue_result_file(filepath)
+        if len(df) == 0:
+            continue
+        for _, row in df.iterrows():
+            source_date = row.get('来源日期')
+            match_date = row.get('匹配日期')
+            source_amount = _normalize_confirm_amount_value(row.get('来源金额'))
+            counterparty = _normalize_confirm_text_value(row.get('来账对方户名'))
+            account = _normalize_confirm_account_value(row.get('对方账号'))
+            if source_date is None or match_date is None or source_amount is None:
+                continue
+
+            candidates_2302 = [
+                rec for rec in by_2302.get((counterparty, account), [])
+                if rec['date'] == match_date.date()
+                and round(abs(rec['amount'] * 100)) == round(abs(source_amount))
+            ]
+            if not candidates_2302:
+                continue
+            rec_2302 = candidates_2302[0]
+
+            candidates_2301 = [
+                rec for rec in by_2301.get((counterparty, account), [])
+                if rec['amount'] > 0
+                and rec_2302['amount'] < 0
+                and round(abs(rec['amount'] * 100)) == round(abs(rec_2302['amount'] * 100))
+                and _normalize_confirm_text_value(rec['receiver_name']) == _normalize_confirm_text_value(rec_2302['receiver_name'])
+                and _normalize_confirm_account_value(rec['receiver_acct']) == _normalize_confirm_account_value(rec_2302['receiver_acct'])
+                and rec['summary'] == rec_2302['summary']
+            ]
+            if not candidates_2301:
+                continue
+
+            source_day = source_date.date() if isinstance(source_date, datetime) else source_date
+            best = None
+            best_diff = None
+            for rec in candidates_2301:
+                diff = abs((rec['date'] - source_day).days)
+                if best is None or diff < best_diff or (diff == best_diff and rec['date'] > best):
+                    best = rec['date']
+                    best_diff = diff
+
+            base_date = max(source_day, best)
+            match_day = match_date.date() if isinstance(match_date, datetime) else match_date
+            interval = working_days_between(base_date, match_day)
+            if interval <= 1:
+                continue
+
+            file_source = row.get('文件来源', '')
+            if not file_source or pd.isna(file_source):
+                file_source = os.path.splitext(os.path.basename(filepath))[0]
+            results.append({
+                '文件来源': file_source,
+                '账号': row.get('账号', ''),
+                '来源金额': source_amount,
+                '摘要': row.get('摘要', ''),
+                '对方账号': row.get('对方账号', ''),
+                '来账对方户名': row.get('来账对方户名', ''),
+                '匹配金额': row.get('匹配金额', np.nan),
+                '窗口截止': row.get('窗口截止', ''),
+                '窗口工作日': row.get('窗口工作日', ''),
+                '状态': row.get('状态', '超期匹配'),
+                '日期间隔': interval,
+                '清算日期': best.strftime('%Y-%m-%d'),
+                '退至垫款户日期': source_date.strftime('%Y-%m-%d'),
+                '退至国库日期': match_date.strftime('%Y-%m-%d'),
+            })
+
+    columns = [
+        '文件来源', '账号', '来源金额', '摘要',
+        '对方账号', '来账对方户名', '匹配金额',
+        '窗口截止', '窗口工作日', '状态', '日期间隔',
+        '清算日期', '退至垫款户日期', '退至国库日期',
+    ]
+    result_df = pd.DataFrame(results, columns=columns)
+    if output_path is not None:
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        result_df.to_excel(output_path, index=False)
+    return result_df
+
+
 def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
     """加载二次确认 CSV，按凭证类型编号筛选记录。"""
     if not _is_csv_file(filepath):
@@ -2158,6 +2307,9 @@ def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
         '收款人姓名': '收款人名称',
         '收款人账号': '收款人账号',
         '收款人帐号': '收款人账号',
+        '摘要名称': '摘要',
+        '摘要': '摘要',
+        '摘要信息': '摘要',
         '凭证类型': '凭证类型编号',
         '凭证类型编号': '凭证类型编号',
         '票据类型': '凭证类型编号',
@@ -2204,6 +2356,9 @@ def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
     df['付款人账号'] = df['付款人账号'].map(_normalize_confirm_account_value)
     df['收款人名称'] = df['收款人名称'].map(_normalize_confirm_text_value)
     df['收款人账号'] = df['收款人账号'].map(_normalize_confirm_account_value)
+    if '摘要' not in df.columns:
+        df['摘要'] = ''
+    df['摘要'] = df['摘要'].fillna('').astype(str).str.strip()
     df['凭证类型编号'] = df['凭证类型编号'].map(_normalize_confirm_code_value)
     df['发生额'] = df['发生额'].map(_normalize_confirm_amount_value)
     if voucher_code:
