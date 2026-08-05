@@ -81,6 +81,7 @@ def run_pipeline(
     settlement_account="待报解预算收入",
     settlement_days=2,
     settlement_confirm=None,
+    settlement_zero_balance=None,
     max_workers=1,
 ):
     """
@@ -232,6 +233,7 @@ def run_pipeline(
             designated_account=settlement_account,
             days_threshold=settlement_days,
             confirm_file_path=settlement_confirm,
+            zero_balance_file_path=settlement_zero_balance,
         )
 
         sc_base = os.path.join(output_dir, os.path.splitext(os.path.basename(settlement_check))[0])
@@ -239,18 +241,24 @@ def run_pipeline(
         unmatched_path = f"{sc_base}_未匹配.xlsx"
         overdue_df = sc_results.get('overdue', pd.DataFrame())
         unmatched_df = sc_results.get('unmatched', pd.DataFrame())
-        result_columns = [
+        overdue_columns = [
+            '文件来源', '账号', '来源日期', '来源金额', '摘要',
+            '对方账号', '来账对方户名', '匹配日期', '匹配金额',
+            '窗口截止', '窗口工作日', '状态', '清算日期',
+        ]
+        unmatched_columns = [
             '文件来源', '账号', '来源日期', '来源金额', '摘要',
             '对方账号', '来账对方户名', '匹配日期', '匹配金额',
             '窗口截止', '窗口工作日', '状态',
         ]
         print(f"  确认CSV: {settlement_confirm}")
         print(f"  目标账户: {settlement_account}")
+        print(f"  零余额账户流水: {settlement_zero_balance or '未提供'}")
         print(f"  窗口内匹配: {sc_results.get('matched', 0)}")
-        pd.DataFrame(overdue_df if len(overdue_df) else None, columns=result_columns).to_excel(
+        pd.DataFrame(overdue_df if len(overdue_df) else None, columns=overdue_columns).to_excel(
             overdue_path, index=False
         )
-        pd.DataFrame(unmatched_df if len(unmatched_df) else None, columns=result_columns).to_excel(
+        pd.DataFrame(unmatched_df if len(unmatched_df) else None, columns=unmatched_columns).to_excel(
             unmatched_path, index=False
         )
         print(f"  超期匹配记录数: {len(overdue_df)}")
@@ -349,6 +357,11 @@ def main():
         help="清算退款确认 CSV 文件路径（必填，凭证类型编号 2302）",
     )
     parser.add_argument(
+        "--settlement-zero-balance",
+        default="",
+        help="零余额账户流水文件夹路径（可选，文件名以账号命名，用于追溯清算日期）",
+    )
+    parser.add_argument(
         "--output-dir",
         default="output",
         help="输出目录 (默认: output)",
@@ -439,6 +452,7 @@ def main():
         settlement_account=settlement_account_list or args.settlement_account,
         settlement_days=args.settlement_days,
         settlement_confirm=args.settlement_confirm or None,
+        settlement_zero_balance=args.settlement_zero_balance or None,
         max_workers=args.workers,
     )
 
