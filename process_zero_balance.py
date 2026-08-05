@@ -2509,7 +2509,7 @@ def detect_settlement_refund_matching(
     overdue_df['清算日期'] = ''
     if len(overdue_df) > 0:
         overdue_df = _fill_settlement_clearing_date(overdue_df, clearing_by_party)
-        overdue_df['日期间隔'] = ''
+        overdue_df['日期间隔'] = np.nan
         for idx, row in overdue_df.iterrows():
             source_date = _parse_confirm_date(row.get('来源日期'))
             match_date = _parse_confirm_date(row.get('匹配日期'))
@@ -2519,7 +2519,7 @@ def detect_settlement_refund_matching(
             base_date = max(source_date, clearing_date)
             overdue_df.loc[idx, '日期间隔'] = working_days_between(base_date, match_date)
     else:
-        overdue_df['日期间隔'] = ''
+        overdue_df['日期间隔'] = np.nan
     for df in (overdue_df, unmatched_df):
         if len(df) > 0:
             df.sort_values('来源日期', ascending=False, inplace=True)
