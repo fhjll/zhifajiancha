@@ -20,7 +20,7 @@ import customtkinter as ctk
 
 from process_zero_balance import detect_fund_matching, detect_non_tax_verification, detect_settlement_refund_matching
 from generate_report import batch_generate
-from preprocess import preprocess_transactions, detect_end_of_day_nonzero
+from preprocess import preprocess_transactions, preprocess_transactions_folder, detect_end_of_day_nonzero
 from logger import setup_logging, log_message, get_log_path
 
 # ── 外观设置 ──
@@ -117,6 +117,7 @@ class App(ctk.CTk):
 
         # ── 流水预处理 ──
         self.preprocess_input_path = ctk.StringVar(value="")
+        self.preprocess_folder_input = ctk.StringVar(value="")
         self.preprocess_output_path = ctk.StringVar(value="")
 
         # ── 延迟清算 ──
@@ -602,13 +603,26 @@ class App(ctk.CTk):
                        ).grid(row=0, column=2, padx=(0, 6))
         r += 1
 
+        # 流水文件夹
+        row_f = ctk.CTkFrame(tab, fg_color="transparent")
+        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
+        row_f.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(row_f, text="流水文件夹", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkEntry(row_f, textvariable=self.preprocess_folder_input,
+                     placeholder_text="选择包含多个流水文件的文件夹，按账号拆分保存...").grid(
+            row=0, column=1, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(row_f, text="目录", width=64,
+                       command=lambda: self._browse_directory(self.preprocess_folder_input)
+                       ).grid(row=0, column=2, padx=(0, 6))
+        r += 1
+
         # 输出路径（可选）
         row_f = ctk.CTkFrame(tab, fg_color="transparent")
         row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
         row_f.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(row_f, text="输出文件", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
         ctk.CTkEntry(row_f, textvariable=self.preprocess_output_path,
-                     placeholder_text="留空则自动生成（原文件名_预处理.xlsx）").grid(
+                     placeholder_text="单文件：输出文件；文件夹：输出目录，留空自动生成").grid(
             row=0, column=1, sticky="ew", padx=(0, 8))
         ctk.CTkButton(row_f, text="另存为", width=64,
                        command=lambda: self._browse_save_as(self.preprocess_output_path,
@@ -704,8 +718,12 @@ class App(ctk.CTk):
         if getattr(self, '_preprocess_running', False):
             return
 
+        folder_path = self.preprocess_folder_input.get().strip()
         input_path = self.preprocess_input_path.get().strip()
-        if not input_path or not os.path.exists(input_path):
+        if folder_path and not os.path.exists(folder_path):
+            self._log_error(f"流水文件夹不存在: {folder_path}")
+            return
+        if not folder_path and (not input_path or not os.path.exists(input_path)):
             self._log_error(f"输入文件不存在: {input_path}")
             return
 
@@ -728,21 +746,28 @@ class App(ctk.CTk):
                 text="▶  开始预处理", state="normal"))
 
     def _run_preprocess_internal(self):
+        folder_path = self.preprocess_folder_input.get().strip()
         input_path = self.preprocess_input_path.get().strip()
         output_path = self.preprocess_output_path.get().strip() or None
 
         self._log_step("═══ 流水文件预处理 ═══")
-        self._log_result(f"  输入文件: {input_path}")
-
-        result_path = preprocess_transactions(input_path, output_path)
-
-        if result_path:
-            self._log_success(f"预处理完成！已保存: {result_path}")
-            # 自动填入延迟清算的输入
-            self.delayed_settlement_input.set(result_path)
-            self._log_result('  已自动将结果填入下方"延迟清算检测"的输入文件')
+        if folder_path:
+            self._log_result(f"  流水文件夹: {folder_path}")
+            self._log_result(f"  输出目录: {output_path or '自动生成（文件夹下按账号拆分）'}")
+            result_paths = preprocess_transactions_folder(folder_path, output_path)
+            for result_path in result_paths:
+                self._log_success(f"  已保存: {result_path}")
+            self._log_success(f"文件夹预处理完成！共 {len(result_paths)} 个账号文件")
         else:
-            self._log_error("预处理失败")
+            self._log_result(f"  输入文件: {input_path}")
+            result_path = preprocess_transactions(input_path, output_path)
+            if result_path:
+                self._log_success(f"预处理完成！已保存: {result_path}")
+                # 自动填入延迟清算的输入
+                self.delayed_settlement_input.set(result_path)
+                self._log_result('  已自动将结果填入下方"延迟清算检测"的输入文件')
+            else:
+                self._log_error("预处理失败")
 
         self._log_step("═══════════════════════════════")
 
