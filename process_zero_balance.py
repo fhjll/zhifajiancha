@@ -2093,8 +2093,48 @@ def _trace_settlement_overdue_original_payment(overdue_df, zero_balance_path):
     return overdue_df
 
 
-def _load_settlement_confirm_csv(filepath):
-    """加载二次确认 CSV，保留凭证类型编号为 2302 的记录。"""
+def _fill_settlement_clearing_date(overdue_df, clearing_by_party):
+    """在确认 CSV 的 2301 记录中，按户名/账号/金额匹配并回填清算日期。"""
+    overdue_df = overdue_df.copy()
+    overdue_df['清算日期'] = ''
+    if len(overdue_df) == 0:
+        return overdue_df
+
+    for idx, row in overdue_df.iterrows():
+        source_date = _parse_confirm_date(row.get('来源日期'))
+        if source_date is None:
+            continue
+        source_day = source_date.date() if isinstance(source_date, datetime) else source_date
+        key = (
+            _normalize_confirm_text_value(row.get('来账对方户名')),
+            _normalize_confirm_account_value(row.get('对方账号')),
+        )
+        candidates = []
+        for confirm_date, confirm_amount in clearing_by_party.get(key, []):
+            source_amount = _normalize_confirm_amount_value(row.get('来源金额'))
+            if (
+                confirm_amount is not None
+                and source_amount is not None
+                and round(abs(confirm_amount * 100)) == round(abs(source_amount))
+            ):
+                candidates.append(confirm_date)
+        if not candidates:
+            continue
+
+        best_date = None
+        best_diff = None
+        for confirm_date in candidates:
+            diff = abs((confirm_date - source_day).days)
+            if best_date is None or diff < best_diff or (diff == best_diff and confirm_date > best_date):
+                best_date = confirm_date
+                best_diff = diff
+        overdue_df.loc[idx, '清算日期'] = best_date.strftime('%Y-%m-%d')
+
+    return overdue_df
+
+
+def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
+    """加载二次确认 CSV，按凭证类型编号筛选记录。"""
     if not _is_csv_file(filepath):
         raise ValueError(f"二次确认数据需为 CSV 文件: {filepath}")
 
@@ -2154,7 +2194,8 @@ def _load_settlement_confirm_csv(filepath):
     df['付款人账号'] = df['付款人账号'].map(_normalize_confirm_account_value)
     df['凭证类型编号'] = df['凭证类型编号'].map(_normalize_confirm_code_value)
     df['发生额'] = df['发生额'].map(_normalize_confirm_amount_value)
-    df = df.loc[df['凭证类型编号'] == '2302'].copy()
+    if voucher_code:
+        df = df.loc[df['凭证类型编号'] == voucher_code].copy()
     df = df.dropna(subset=['发生额'])
     return df.sort_values('日期对象').reset_index(drop=True)
 
@@ -2342,7 +2383,7 @@ def detect_settlement_refund_matching(
     - 两个工作日内匹配：不保存
     - 匹配日期超过两个工作日：保存为“超期匹配”
     - 未匹配到任何确认记录：保存为“未匹配”
-    - 提供零余额账户流水文件夹时，超期匹配结果新增“清算日期”反向追溯列
+    - 超期匹配结果在确认 CSV 的 2301 记录中匹配清算日期
     """
     if not confirm_file_path:
         raise ValueError("清算退款确认必须提供确认 CSV 文件路径")
@@ -2368,6 +2409,14 @@ def detect_settlement_refund_matching(
         )
     for key in confirm_by_party:
         confirm_by_party[key].sort(key=lambda x: x[0])
+
+    clearing_df = _load_settlement_confirm_csv(confirm_file_path, voucher_code='2301')
+    clearing_by_party = {}
+    for idx, row in clearing_df.iterrows():
+        key = (row['付款人名称'], row['付款人账号'])
+        clearing_by_party.setdefault(key, []).append(
+            (row['日期对象'].date(), row['发生额'])
+        )
 
     inflows, file_label, account_num = _load_settlement_refund_records(file_path)
     refunds = [
@@ -2433,10 +2482,8 @@ def detect_settlement_refund_matching(
     overdue_df = pd.DataFrame(overdue_results)
     unmatched_df = pd.DataFrame(unmatched_results)
     overdue_df['清算日期'] = ''
-    if zero_balance_file_path and len(overdue_df) > 0:
-        overdue_df = _trace_settlement_overdue_original_payment(
-            overdue_df, zero_balance_file_path
-        )
+    if len(overdue_df) > 0:
+        overdue_df = _fill_settlement_clearing_date(overdue_df, clearing_by_party)
     for df in (overdue_df, unmatched_df):
         if len(df) > 0:
             df.sort_values('来源日期', ascending=False, inplace=True)
