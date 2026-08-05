@@ -55,7 +55,7 @@ def _get_column_groups():
 def _find_column(df, aliases):
     """在 DataFrame 列名中查找第一个匹配别名的列，返回列名或 None。"""
     for col in df.columns:
-        col_clean = str(col).strip()
+        col_clean = str(col).strip().lstrip('\ufeff')
         if col_clean in aliases:
             return col
     return None
@@ -350,6 +350,126 @@ def preprocess_transactions(input_path, output_path=None):
     wb.save(output_path)
     print(f"\n  预处理完成，已保存: {output_path}")
     return output_path
+
+
+def _read_flow_records(filepath):
+    """读取单个流水文件中的全部记录（Excel 多 Sheet 或 CSV/TXT）。"""
+    groups = _get_column_groups()
+
+    if _is_excel_file(filepath):
+        xls = pd.ExcelFile(filepath)
+        all_records = []
+        for sheet_name in xls.sheet_names:
+            header_row = _detect_header_row(xls, sheet_name)
+            df = pd.read_excel(xls, sheet_name=sheet_name, header=header_row)
+            df = df.dropna(how='all').reset_index(drop=True)
+            if len(df) > 0:
+                all_records.extend(_extract_account_records(df, groups, sheet_name))
+        return all_records
+
+    df = None
+    for encoding in ('utf-8', 'gbk', 'gb2312', 'utf-16'):
+        try:
+            df = pd.read_csv(filepath, encoding=encoding)
+            break
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    if df is None:
+        raise ValueError(f"无法识别文件编码: {filepath}")
+    df = df.dropna(how='all').reset_index(drop=True)
+    return _extract_account_records(df, groups, os.path.basename(filepath))
+
+
+def _extract_account_records(df, groups, source_label):
+    """从单个 DataFrame 中按账号/日期/时间提取流水记录。"""
+    acct_col = _find_column(df, set(groups['account']))
+    date_col = _find_column(df, set(groups['date']))
+    time_col = _find_column(df, set(groups['time']))
+
+    if acct_col is None:
+        raise ValueError(f"文件 {source_label} 未找到账户列（尝试识别: {groups['account']}）")
+    if date_col is None:
+        raise ValueError(f"文件 {source_label} 未找到日期列（尝试识别: {groups['date']}）")
+
+    acct_non_null_count = df[acct_col].notna().sum()
+    if acct_non_null_count > 0 and acct_non_null_count < len(df) * 0.3:
+        df[acct_col] = df[acct_col].ffill()
+
+    records = []
+    for idx, row in df.iterrows():
+        acct_str = _safe_str(row.get(acct_col))
+        if not acct_str:
+            continue
+        time_val = row.get(time_col) if time_col else None
+        dt, ok = _parse_datetime(row.get(date_col), time_val)
+        if not ok:
+            continue
+        record = {'_账户': acct_str, '_日期时间': dt}
+        for col in df.columns:
+            record[col] = row[col]
+        records.append(record)
+    return records
+
+
+def _safe_filename(name):
+    """将账号转为安全的文件名。"""
+    name = str(name).strip()
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', name)
+    name = name.strip('. ')
+    return name or '未知账号'
+
+
+def preprocess_transactions_folder(input_folder, output_dir=None):
+    """
+    文件夹流水按账号拆分：读取文件夹内所有流水文件，按账号分组，
+    每个账号按原日期时间排序后保存为独立 Excel 文件，文件名为账号。
+    """
+    if not os.path.isdir(input_folder):
+        raise NotADirectoryError(f"流水文件夹不存在: {input_folder}")
+
+    if output_dir is None:
+        output_dir = os.path.join(input_folder, '按账号拆分')
+    os.makedirs(output_dir, exist_ok=True)
+
+    exts = ('.csv', '.txt', '.xlsx', '.xls')
+    files = sorted(
+        os.path.join(input_folder, name)
+        for name in os.listdir(input_folder)
+        if os.path.splitext(name)[1].lower() in exts
+    )
+    if not files:
+        raise ValueError(f"文件夹中没有流水文件: {input_folder}")
+
+    all_records = []
+    for filepath in files:
+        print(f"  读取文件: {filepath}")
+        all_records.extend(_read_flow_records(filepath))
+
+    if not all_records:
+        raise ValueError("未读取到任何有效的流水记录")
+
+    df = pd.DataFrame(all_records)
+    grouped = df.groupby('_账户', sort=False)
+    output_columns = [c for c in df.columns if not c.startswith('_')]
+    output_paths = []
+
+    for acct in grouped.groups:
+        group = grouped.get_group(acct).copy()
+        group = group.sort_values('_日期时间', kind='stable', ascending=True).reset_index(drop=True)
+        filename = f"{_safe_filename(acct)}.xlsx"
+        output_path = os.path.join(output_dir, filename)
+        group[output_columns].to_excel(output_path, index=False)
+        output_paths.append(output_path)
+        print(f"  账号 [{acct}] -> {output_path} ({len(group)} 条)")
+
+    print(f"\n  文件夹拆分完成，共 {len(output_paths)} 个账号文件")
+    print(f"  输出目录: {output_dir}")
+    return output_paths
+
+
+def preprocess_transactions_floder(input_folder, output_dir=None):
+    """兼容历史拼写的别名，等价于 preprocess_transactions_folder。"""
+    return preprocess_transactions_folder(input_folder, output_dir)
 
 
 def detect_end_of_day_nonzero(input_path, output_path=None):
