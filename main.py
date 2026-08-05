@@ -237,31 +237,52 @@ def run_pipeline(
         sc_base = os.path.join(output_dir, os.path.splitext(os.path.basename(settlement_check))[0])
         overdue_path = f"{sc_base}_超期匹配.xlsx"
         unmatched_path = f"{sc_base}_未匹配.xlsx"
+        interval_path = f"{sc_base}_日期间隔异常.xlsx"
         overdue_df = sc_results.get('overdue', pd.DataFrame())
         unmatched_df = sc_results.get('unmatched', pd.DataFrame())
         overdue_columns = [
-            '文件来源', '账号', '来源日期', '来源金额', '摘要',
-            '对方账号', '来账对方户名', '匹配日期', '匹配金额',
-            '窗口截止', '窗口工作日', '状态', '清算日期',
+            '文件来源', '账号', '来源金额', '摘要',
+            '对方账号', '来账对方户名', '匹配金额',
+            '窗口截止', '窗口工作日', '状态', '日期间隔',
+            '清算日期', '退至垫款户日期', '退至国库日期',
         ]
         unmatched_columns = [
-            '文件来源', '账号', '来源日期', '来源金额', '摘要',
-            '对方账号', '来账对方户名', '匹配日期', '匹配金额',
+            '文件来源', '账号', '来源金额', '摘要',
+            '对方账号', '来账对方户名', '匹配金额',
             '窗口截止', '窗口工作日', '状态',
+            '清算日期', '退至垫款户日期', '退至国库日期',
         ]
         print(f"  确认CSV: {settlement_confirm}")
         print(f"  目标账户: {settlement_account}")
         print(f"  窗口内匹配: {sc_results.get('matched', 0)}")
-        pd.DataFrame(overdue_df if len(overdue_df) else None, columns=overdue_columns).to_excel(
+        overdue_save = overdue_df.rename(columns={
+            '来源日期': '退至垫款户日期',
+            '匹配日期': '退至国库日期',
+        }).copy()
+        if len(overdue_save) > 0:
+            overdue_save['日期间隔'] = pd.to_numeric(overdue_save['日期间隔'], errors='coerce')
+        unmatched_save = unmatched_df.rename(columns={
+            '来源日期': '退至垫款户日期',
+            '匹配日期': '退至国库日期',
+        }).copy()
+        if len(unmatched_save) > 0:
+            unmatched_save['清算日期'] = ''
+        pd.DataFrame(overdue_save if len(overdue_save) else None, columns=overdue_columns).to_excel(
             overdue_path, index=False
         )
-        pd.DataFrame(unmatched_df if len(unmatched_df) else None, columns=unmatched_columns).to_excel(
+        pd.DataFrame(unmatched_save if len(unmatched_save) else None, columns=unmatched_columns).to_excel(
             unmatched_path, index=False
+        )
+        interval_save = overdue_save[overdue_save['日期间隔'] > 1].copy() if len(overdue_save) > 0 else pd.DataFrame()
+        pd.DataFrame(interval_save if len(interval_save) else None, columns=overdue_columns).to_excel(
+            interval_path, index=False
         )
         print(f"  超期匹配记录数: {len(overdue_df)}")
         print(f"  未匹配记录数: {len(unmatched_df)}")
+        print(f"  日期间隔异常记录数: {len(interval_save)}")
         print(f"  超期匹配结果已保存: {overdue_path}")
         print(f"  未匹配结果已保存: {unmatched_path}")
+        print(f"  日期间隔异常结果已保存: {interval_path}")
 
     print()
     print("=" * 50)
