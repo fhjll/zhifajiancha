@@ -2110,12 +2110,16 @@ def _fill_settlement_clearing_date(overdue_df, clearing_by_party):
             _normalize_confirm_account_value(row.get('对方账号')),
         )
         candidates = []
-        for confirm_date, confirm_amount in clearing_by_party.get(key, []):
+        required_receiver_name = _normalize_confirm_text_value(row.get('匹配收款人名称'))
+        required_receiver_acct = _normalize_confirm_account_value(row.get('匹配收款人账号'))
+        for confirm_date, confirm_amount, receiver_name, receiver_acct in clearing_by_party.get(key, []):
             source_amount = _normalize_confirm_amount_value(row.get('来源金额'))
             if (
                 confirm_amount is not None
                 and source_amount is not None
                 and round(abs(confirm_amount * 100)) == round(abs(source_amount))
+                and _normalize_confirm_text_value(receiver_name) == required_receiver_name
+                and _normalize_confirm_account_value(receiver_acct) == required_receiver_acct
             ):
                 candidates.append(confirm_date)
         if not candidates:
@@ -2130,6 +2134,7 @@ def _fill_settlement_clearing_date(overdue_df, clearing_by_party):
                 best_diff = diff
         overdue_df.loc[idx, '清算日期'] = best_date.strftime('%Y-%m-%d')
 
+    overdue_df = overdue_df.drop(columns=['匹配收款人名称', '匹配收款人账号'], errors='ignore')
     return overdue_df
 
 
@@ -2148,6 +2153,11 @@ def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
         '付款人姓名': '付款人名称',
         '付款人账号': '付款人账号',
         '付款人帐号': '付款人账号',
+        '收款人名称': '收款人名称',
+        '收款人户名': '收款人名称',
+        '收款人姓名': '收款人名称',
+        '收款人账号': '收款人账号',
+        '收款人帐号': '收款人账号',
         '凭证类型': '凭证类型编号',
         '凭证类型编号': '凭证类型编号',
         '票据类型': '凭证类型编号',
@@ -2180,7 +2190,7 @@ def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
     if '发生额' not in df.columns and '支付金额' in df.columns:
         df['发生额'] = df['支付金额']
 
-    required_cols = ['交易日期', '付款人名称', '付款人账号', '凭证类型编号', '发生额']
+    required_cols = ['交易日期', '付款人名称', '付款人账号', '收款人名称', '收款人账号', '凭证类型编号', '发生额']
     missing_cols = [c for c in required_cols if c not in df.columns]
     if missing_cols:
         raise ValueError(
@@ -2192,6 +2202,8 @@ def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
     df = df.dropna(subset=['日期对象'])
     df['付款人名称'] = df['付款人名称'].map(_normalize_confirm_text_value)
     df['付款人账号'] = df['付款人账号'].map(_normalize_confirm_account_value)
+    df['收款人名称'] = df['收款人名称'].map(_normalize_confirm_text_value)
+    df['收款人账号'] = df['收款人账号'].map(_normalize_confirm_account_value)
     df['凭证类型编号'] = df['凭证类型编号'].map(_normalize_confirm_code_value)
     df['发生额'] = df['发生额'].map(_normalize_confirm_amount_value)
     if voucher_code:
@@ -2405,7 +2417,13 @@ def detect_settlement_refund_matching(
     for idx, row in confirm_df.iterrows():
         key = (row['付款人名称'], row['付款人账号'])
         confirm_by_party.setdefault(key, []).append(
-            (row['日期对象'].date(), idx, row['发生额'])
+            (
+                row['日期对象'].date(),
+                idx,
+                row['发生额'],
+                row['收款人名称'],
+                row['收款人账号'],
+            )
         )
     for key in confirm_by_party:
         confirm_by_party[key].sort(key=lambda x: x[0])
@@ -2415,7 +2433,12 @@ def detect_settlement_refund_matching(
     for idx, row in clearing_df.iterrows():
         key = (row['付款人名称'], row['付款人账号'])
         clearing_by_party.setdefault(key, []).append(
-            (row['日期对象'].date(), row['发生额'])
+            (
+                row['日期对象'].date(),
+                row['发生额'],
+                row['收款人名称'],
+                row['收款人账号'],
+            )
         )
 
     inflows, file_label, account_num = _load_settlement_refund_records(file_path)
@@ -2434,7 +2457,7 @@ def detect_settlement_refund_matching(
         key = (refund['counterparty'], refund['account'])
         matched = None
 
-        for confirm_date, confirm_idx, confirm_amount in confirm_by_party.get(key, []):
+        for confirm_date, confirm_idx, confirm_amount, receiver_name, receiver_acct in confirm_by_party.get(key, []):
             if confirm_date < source_day:
                 continue
             if confirm_idx in matched_confirm:
@@ -2445,7 +2468,7 @@ def detect_settlement_refund_matching(
                 and round(abs(confirm_amount * 100)) == round(abs(refund['amount']))
             ):
                 matched_confirm.add(confirm_idx)
-                matched = (confirm_date, confirm_amount)
+                matched = (confirm_date, confirm_amount, receiver_name, receiver_acct)
                 break
 
         if matched is None:
@@ -2474,6 +2497,8 @@ def detect_settlement_refund_matching(
                 '来账对方户名': refund['counterparty'],
                 '匹配日期': matched[0].strftime('%Y-%m-%d'),
                 '匹配金额': matched[1],
+                '匹配收款人名称': matched[2],
+                '匹配收款人账号': matched[3],
                 '窗口截止': deadline.strftime('%Y-%m-%d'),
                 '窗口工作日': days_threshold,
                 '状态': '超期匹配',
@@ -2484,6 +2509,17 @@ def detect_settlement_refund_matching(
     overdue_df['清算日期'] = ''
     if len(overdue_df) > 0:
         overdue_df = _fill_settlement_clearing_date(overdue_df, clearing_by_party)
+        overdue_df['日期间隔'] = ''
+        for idx, row in overdue_df.iterrows():
+            source_date = _parse_confirm_date(row.get('来源日期'))
+            match_date = _parse_confirm_date(row.get('匹配日期'))
+            clearing_date = _parse_confirm_date(row.get('清算日期'))
+            if source_date is None or match_date is None or clearing_date is None:
+                continue
+            base_date = max(source_date, clearing_date)
+            overdue_df.loc[idx, '日期间隔'] = working_days_between(base_date, match_date)
+    else:
+        overdue_df['日期间隔'] = ''
     for df in (overdue_df, unmatched_df):
         if len(df) > 0:
             df.sort_values('来源日期', ascending=False, inplace=True)
