@@ -467,6 +467,62 @@ def preprocess_transactions_folder(input_folder, output_dir=None):
     return output_paths
 
 
+def detect_finance_account_verification(input_path, keywords=None):
+    """
+    财政专户校验：筛选对方户名包含指定关键字的交易，按对方户名汇总数量。
+    """
+    if keywords is None:
+        keywords = ['待报解', '待结算', '非税收入', '暂收款', '暂付款']
+
+    if os.path.isdir(input_path):
+        exts = ('.csv', '.txt', '.xlsx', '.xls')
+        files = sorted(
+            os.path.join(input_path, name)
+            for name in os.listdir(input_path)
+            if os.path.splitext(name)[1].lower() in exts
+        )
+        if not files:
+            raise ValueError(f"文件夹中没有流水文件: {input_path}")
+    else:
+        files = [input_path]
+
+    all_records = []
+    for filepath in files:
+        print(f"  读取文件: {filepath}")
+        all_records.extend(_read_flow_records(filepath))
+
+    if not all_records:
+        raise ValueError("未读取到任何有效的流水记录")
+
+    df = pd.DataFrame(all_records)
+    cpty_col = _find_column(df, {'对方户名', '对方行名', '付款人名称', '收款人名称'})
+    if cpty_col is None:
+        raise ValueError("未找到对方户名/付款人名称/收款人名称列")
+
+    groups = _get_column_groups()
+    amt_col = _find_column(df, set(groups['amount']))
+    pattern = '|'.join(re.escape(keyword) for keyword in keywords)
+    mask = df[cpty_col].astype(str).str.contains(pattern, na=False, regex=True)
+    filtered = df.loc[mask]
+    if len(filtered) == 0:
+        columns = ['对方户名', '交易笔数']
+        if amt_col:
+            columns.append('金额合计')
+        return pd.DataFrame(columns=columns)
+
+    result = filtered.groupby(cpty_col, sort=False).agg(
+        交易笔数=(cpty_col, 'size'),
+    ).reset_index()
+    result = result.rename(columns={cpty_col: '对方户名'})
+    if amt_col:
+        result['金额合计'] = filtered.groupby(cpty_col)[amt_col].apply(
+            lambda s: pd.to_numeric(s, errors='coerce').sum()
+        ).reset_index(drop=True)
+        result = result[['对方户名', '交易笔数', '金额合计']]
+    result = result.sort_values('交易笔数', ascending=False).reset_index(drop=True)
+    return result
+
+
 def preprocess_transactions_floder(input_folder, output_dir=None):
     """兼容历史拼写的别名，等价于 preprocess_transactions_folder。"""
     return preprocess_transactions_folder(input_folder, output_dir)
