@@ -126,6 +126,7 @@ class App(ctk.CTk):
 
         # ── 财政专户校验 ──
         self.finance_account_file_path = ctk.StringVar(value="")
+        self.finance_account_keywords = ctk.StringVar(value="待报解,待结算,非税收入,暂收款,暂付款")
 
         # ── 延迟清算 ──
         self.delayed_settlement_input = ctk.StringVar(value="")
@@ -712,7 +713,7 @@ class App(ctk.CTk):
         r += 1
 
         ctk.CTkLabel(tab,
-                     text="筛选对方户名包含待报解/待结算/非税收入/暂收款/暂付款的交易，按对方户名汇总数量",
+                     text="筛选对方户名包含指定关键字的交易，按对方户名汇总数量；关键字可随时修改",
                      font=ctk.CTkFont(size=11), text_color="gray",
                      wraplength=600, justify="left"
                      ).grid(row=r, column=0, columnspan=3, sticky="w", padx=(12, 0), pady=(0, 8))
@@ -731,6 +732,15 @@ class App(ctk.CTk):
         ctk.CTkButton(row_f, text="目录", width=64,
                        command=lambda: self._browse_directory(self.finance_account_file_path)
                        ).grid(row=0, column=3, padx=(0, 6))
+        r += 1
+
+        row_f = ctk.CTkFrame(tab, fg_color="transparent")
+        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
+        row_f.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(row_f, text="关键字", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkEntry(row_f, textvariable=self.finance_account_keywords,
+                     placeholder_text="多个关键字用逗号分隔，如: 待报解,暂收款,非税收入").grid(
+            row=0, column=1, columnspan=2, sticky="ew", padx=(0, 6))
         r += 1
 
         self.run_finance_btn = ctk.CTkButton(
@@ -776,7 +786,14 @@ class App(ctk.CTk):
 
         self._log_step("═══ 财政专户校验 ═══")
         self._log_result(f"  流水文件/文件夹: {file_path}")
-        results = detect_finance_account_verification(file_path)
+        keywords_text = self.finance_account_keywords.get().strip()
+        keywords = [
+            kw.strip()
+            for kw in keywords_text.replace('，', ',').split(',')
+            if kw.strip()
+        ] or ['待报解', '待结算', '非税收入', '暂收款', '暂付款']
+        self._log_result(f"  关键字: {', '.join(keywords)}")
+        results = detect_finance_account_verification(file_path, keywords=keywords)
         results.to_excel(output_path, index=False)
         self._log_result(f"  匹配对方户名数: {len(results)}")
         self._log_result(f"  匹配交易笔数: {int(results['交易笔数'].sum()) if len(results) > 0 else 0}")
