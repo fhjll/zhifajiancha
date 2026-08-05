@@ -18,7 +18,12 @@ import pandas as pd
 
 import customtkinter as ctk
 
-from process_zero_balance import detect_fund_matching, detect_non_tax_verification, detect_settlement_refund_matching
+from process_zero_balance import (
+    detect_fund_matching,
+    detect_non_tax_verification,
+    detect_settlement_refund_matching,
+    detect_interval_anomalies_from_overdue_folder,
+)
 from generate_report import batch_generate
 from preprocess import (
     preprocess_transactions,
@@ -128,6 +133,10 @@ class App(ctk.CTk):
         self.finance_account_file_path = ctk.StringVar(value="")
         self.finance_account_keywords = ctk.StringVar(value="待报解,待结算,非税收入,暂收款,暂付款")
 
+        # ── 日期间隔异常检测 ──
+        self.interval_confirm_file = ctk.StringVar(value="")
+        self.interval_overdue_folder = ctk.StringVar(value="")
+
         # ── 延迟清算 ──
         self.delayed_settlement_input = ctk.StringVar(value="")
         self.delayed_settlement_output = ctk.StringVar(value="")
@@ -150,6 +159,7 @@ class App(ctk.CTk):
         self.running_nt = False
         self.running_sc = False
         self.running_finance = False
+        self.running_interval = False
 
         # 并行控制
         self.max_workers = ctk.StringVar(value="1")
@@ -211,6 +221,7 @@ class App(ctk.CTk):
         self.tab_report = self.tabview.add("文书生成")
         self.tab_preprocess = self.tabview.add("流水预处理")
         self.tab_finance = self.tabview.add("财政专户校验")
+        self.tab_interval = self.tabview.add("日期间隔异常检测")
 
         # 为每个标签页构建内容
         self._build_tab_clear()
@@ -218,6 +229,7 @@ class App(ctk.CTk):
         self._build_tab_report()
         self._build_tab_preprocess()
         self._build_tab_finance()
+        self._build_tab_interval()
 
         # ── 日志标签 ──
         log_label = ctk.CTkLabel(
@@ -800,6 +812,109 @@ class App(ctk.CTk):
         self._log_success(f"财政专户校验结果已保存: {output_path}")
         self._log_step("═══════════════════════════════")
         self._log_success("财政专户校验完成！")
+
+    # ── 标签页6: 日期间隔异常检测 ──
+
+    def _build_tab_interval(self):
+        tab = self.tab_interval
+        LW = self.LABEL_W
+        tab.grid_columnconfigure(1, weight=1)
+
+        r = 0
+        ctk.CTkLabel(tab, text="📂 日期间隔异常检测",
+                     font=ctk.CTkFont(size=15, weight="bold")
+                     ).grid(row=r, column=0, columnspan=3, sticky="w", pady=(14, 4), padx=(12, 0))
+        r += 1
+
+        ctk.CTkLabel(tab,
+                     text="选择确认CSV和包含超期匹配结果的文件夹，重新匹配清算日期并汇总日期间隔大于1个工作日的记录",
+                     font=ctk.CTkFont(size=11), text_color="gray",
+                     wraplength=600, justify="left"
+                     ).grid(row=r, column=0, columnspan=3, sticky="w", padx=(12, 0), pady=(0, 8))
+        r += 1
+
+        row_f = ctk.CTkFrame(tab, fg_color="transparent")
+        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
+        row_f.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(row_f, text="确认CSV", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkEntry(row_f, textvariable=self.interval_confirm_file,
+                     placeholder_text="选择包含2301/2302记录的确认CSV...").grid(
+            row=0, column=1, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(row_f, text="浏览", width=64,
+                       command=lambda: self._browse_file(self.interval_confirm_file)
+                       ).grid(row=0, column=2, padx=(0, 6))
+        r += 1
+
+        row_f = ctk.CTkFrame(tab, fg_color="transparent")
+        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
+        row_f.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(row_f, text="超期文件夹", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkEntry(row_f, textvariable=self.interval_overdue_folder,
+                     placeholder_text="选择包含 来源文件名称_超期匹配 结果文件的文件夹...").grid(
+            row=0, column=1, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(row_f, text="目录", width=64,
+                       command=lambda: self._browse_directory(self.interval_overdue_folder)
+                       ).grid(row=0, column=2, padx=(0, 6))
+        r += 1
+
+        self.run_interval_btn = ctk.CTkButton(
+            tab, text="▶  开始检测",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            height=44, corner_radius=8,
+            command=self._run_interval_check,
+        )
+        self.run_interval_btn.grid(row=r, column=0, columnspan=3, sticky="ew",
+                                   padx=12, pady=(20, 12))
+        r += 1
+
+    def _run_interval_check(self):
+        if self.running_interval:
+            return
+        confirm_file = self.interval_confirm_file.get().strip()
+        overdue_folder = self.interval_overdue_folder.get().strip()
+        if not confirm_file or not os.path.exists(confirm_file):
+            self._log_error(f"确认CSV不存在: {confirm_file}")
+            return
+        if not overdue_folder or not os.path.exists(overdue_folder):
+            self._log_error(f"超期匹配文件夹不存在: {overdue_folder}")
+            return
+
+        self.running_interval = True
+        self.run_interval_btn.configure(text="⏳  检测中...", state="disabled")
+        thread = threading.Thread(target=self._interval_check_worker, daemon=True)
+        thread.start()
+
+    def _interval_check_worker(self):
+        try:
+            self._run_interval_check_internal()
+        except Exception as e:
+            self._log_error(f"日期间隔异常检测出错: {e}")
+            import traceback
+            self._log_error(traceback.format_exc())
+        finally:
+            self.running_interval = False
+            self.after(0, lambda: self.run_interval_btn.configure(
+                text="▶  开始检测", state="normal"))
+
+    def _run_interval_check_internal(self):
+        confirm_file = self.interval_confirm_file.get().strip()
+        overdue_folder = self.interval_overdue_folder.get().strip()
+        out_dir = self.output_dir.get()
+        os.makedirs(out_dir, exist_ok=True)
+        output_path = os.path.join(out_dir, "日期间隔异常汇总.xlsx")
+
+        self._log_step("═══ 日期间隔异常检测 ═══")
+        self._log_result(f"  确认CSV: {confirm_file}")
+        self._log_result(f"  超期匹配文件夹: {overdue_folder}")
+        results = detect_interval_anomalies_from_overdue_folder(
+            confirm_file_path=confirm_file,
+            overdue_folder=overdue_folder,
+            output_path=output_path,
+        )
+        self._log_result(f"  日期间隔异常记录数: {len(results)}")
+        self._log_success(f"日期间隔异常结果已保存: {output_path}")
+        self._log_step("═══════════════════════════════")
+        self._log_success("日期间隔异常检测完成！")
 
     # ── 文件选择（另存为） ──
 
