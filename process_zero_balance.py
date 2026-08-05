@@ -1946,6 +1946,153 @@ def _parse_confirm_date(value):
     return None
 
 
+def _parse_zero_balance_time(df):
+    """解析零余额账户流水时间；没有时间列或无法解析时按当天 00:00 处理。"""
+    time_col = None
+    for c in ('入帐时间', '入账时间', '交易时间', '时间'):
+        if c in df.columns:
+            time_col = c
+            break
+    if time_col is None:
+        df['时间对象'] = df['日期对象']
+        return df
+    try:
+        return _parse_non_tax_time(df)
+    except ValueError:
+        df['时间对象'] = df['日期对象']
+        return df
+
+
+def _load_zero_balance_flow_file(filepath):
+    """读取一个零余额账户流水文件，合并 Excel 多 Sheet，统一日期/时间/金额/账号字段。"""
+    if _is_csv_file(filepath):
+        _, df = _load_dataframe(filepath)
+        if len(df) == 0:
+            return pd.DataFrame()
+        df = _normalize_csv_columns(df, convert_fen=False)
+        date_col = None
+        for c in ('交易日期', '入帐日期', '入账日期'):
+            if c in df.columns:
+                date_col = c
+                break
+        if date_col is None:
+            return pd.DataFrame()
+        df = df.dropna(subset=[date_col])
+        df['日期对象'] = df[date_col].apply(_parse_confirm_date)
+        df = df.dropna(subset=['日期对象'])
+        if '交易金额' in df.columns:
+            df['交易金额'] = pd.to_numeric(df['交易金额'], errors='coerce')
+        elif '发生额' in df.columns:
+            df['交易金额'] = pd.to_numeric(df['发生额'], errors='coerce')
+        df = _normalize_amount_vectorized(df)
+        if '对方账号' not in df.columns and '对方帐号' in df.columns:
+            df['对方账号'] = df['对方帐号']
+        if '对方账号' not in df.columns:
+            df['对方账号'] = ''
+    else:
+        xls = pd.ExcelFile(filepath)
+        frames = []
+        for sheet_name in xls.sheet_names:
+            sheet_df = _load_zero_balance(xls, sheet_name)
+            if len(sheet_df) > 0:
+                sheet_df['_sheet名称'] = sheet_name
+                frames.append(sheet_df)
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
+        if '对方账号' not in df.columns and '对方帐号' in df.columns:
+            df['对方账号'] = df['对方帐号']
+        if '对方账号' not in df.columns:
+            df['对方账号'] = ''
+
+    if len(df) == 0:
+        return pd.DataFrame()
+    df['交易金额'] = pd.to_numeric(df['交易金额'], errors='coerce')
+    df['对方账号'] = df['对方账号'].map(_normalize_confirm_account_value)
+    df = _parse_zero_balance_time(df)
+    return df.sort_values('时间对象').reset_index(drop=True)
+
+
+def _find_zero_balance_file(folder, account):
+    """在零余额账户文件夹中按文件名（账号）查找对应流水文件。"""
+    if os.path.isfile(folder):
+        return folder
+    if not os.path.isdir(folder):
+        return None
+    target = _normalize_confirm_account_value(account)
+    for name in os.listdir(folder):
+        stem = os.path.splitext(name)[0]
+        if _normalize_confirm_account_value(stem) == target:
+            return os.path.join(folder, name)
+    return None
+
+
+def _same_amount_in_fen(a, b):
+    a = _normalize_confirm_amount_value(a)
+    b = _normalize_confirm_amount_value(b)
+    if a is None or b is None:
+        return False
+    return round(abs(a) * 100) == round(abs(b) * 100)
+
+
+def _trace_settlement_overdue_original_payment(overdue_df, zero_balance_path):
+    """对超期匹配记录反向追溯原始支付日期，回填清算日期列。"""
+    overdue_df = overdue_df.copy()
+    overdue_df['清算日期'] = ''
+    if zero_balance_path is None or len(overdue_df) == 0:
+        return overdue_df
+
+    file_cache = {}
+    for idx, row in overdue_df.iterrows():
+        zero_file = _find_zero_balance_file(zero_balance_path, row.get('对方账号'))
+        if zero_file is None:
+            continue
+        if zero_file not in file_cache:
+            file_cache[zero_file] = _load_zero_balance_flow_file(zero_file)
+        zero_df = file_cache[zero_file]
+        if len(zero_df) == 0:
+            continue
+
+        source_date = _parse_confirm_date(row.get('来源日期'))
+        source_amount = row.get('来源金额')
+        if source_date is None or source_amount is None:
+            continue
+
+        incoming_mask = (
+            (zero_df['交易金额'] > 0)
+            & (zero_df['日期对象'] <= source_date)
+        )
+        incoming_candidates = zero_df[incoming_mask]
+        if len(incoming_candidates) == 0:
+            continue
+        incoming_candidates = incoming_candidates[
+            incoming_candidates['交易金额'].apply(lambda x: _same_amount_in_fen(x, source_amount))
+        ].sort_values('时间对象', ascending=False)
+        if len(incoming_candidates) == 0:
+            continue
+        incoming = incoming_candidates.iloc[0]
+        incoming_time = incoming['时间对象']
+        incoming_acct = incoming['对方账号']
+
+        outbound_mask = (
+            (zero_df['交易金额'] < 0)
+            & (zero_df['时间对象'] < incoming_time)
+            & (zero_df['对方账号'] == incoming_acct)
+        )
+        outbound_candidates = zero_df[outbound_mask]
+        if len(outbound_candidates) == 0:
+            continue
+        outbound_candidates = outbound_candidates[
+            outbound_candidates['交易金额'].apply(lambda x: _same_amount_in_fen(x, incoming['交易金额']))
+        ].sort_values('时间对象', ascending=False)
+        if len(outbound_candidates) == 0:
+            continue
+        outbound = outbound_candidates.iloc[0]
+        overdue_df.loc[idx, '清算日期'] = outbound['日期对象'].strftime('%Y-%m-%d')
+
+    return overdue_df
+
+
 def _load_settlement_confirm_csv(filepath):
     """加载二次确认 CSV，保留凭证类型编号为 2302 的记录。"""
     if not _is_csv_file(filepath):
@@ -2179,6 +2326,7 @@ def detect_settlement_refund_matching(
     designated_account = '待报解预算收入',
     days_threshold: int = 2,
     confirm_file_path: Optional[str] = None,
+    zero_balance_file_path: Optional[str] = None,
 ) -> dict:
     """
     清算退款逐笔匹配：先排除目标账户内部来账，再对每笔退款按时间顺序匹配确认 CSV。
@@ -2194,6 +2342,7 @@ def detect_settlement_refund_matching(
     - 两个工作日内匹配：不保存
     - 匹配日期超过两个工作日：保存为“超期匹配”
     - 未匹配到任何确认记录：保存为“未匹配”
+    - 提供零余额账户流水文件夹时，超期匹配结果新增“清算日期”反向追溯列
     """
     if not confirm_file_path:
         raise ValueError("清算退款确认必须提供确认 CSV 文件路径")
@@ -2283,6 +2432,11 @@ def detect_settlement_refund_matching(
 
     overdue_df = pd.DataFrame(overdue_results)
     unmatched_df = pd.DataFrame(unmatched_results)
+    overdue_df['清算日期'] = ''
+    if zero_balance_file_path and len(overdue_df) > 0:
+        overdue_df = _trace_settlement_overdue_original_payment(
+            overdue_df, zero_balance_file_path
+        )
     for df in (overdue_df, unmatched_df):
         if len(df) > 0:
             df.sort_values('来源日期', ascending=False, inplace=True)
@@ -2305,6 +2459,7 @@ def detect_settlement_verification(
     designated_account = '待报解预算收入',
     days_threshold: int = 2,
     confirm_file_path: Optional[str] = None,
+    zero_balance_file_path: Optional[str] = None,
 ) -> pd.DataFrame:
     """兼容入口：返回未匹配记录。"""
     return detect_settlement_refund_matching(
@@ -2312,6 +2467,7 @@ def detect_settlement_verification(
         designated_account=designated_account,
         days_threshold=days_threshold,
         confirm_file_path=confirm_file_path,
+        zero_balance_file_path=zero_balance_file_path,
     )['unmatched']
 
 
