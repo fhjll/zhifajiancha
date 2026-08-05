@@ -20,7 +20,12 @@ import customtkinter as ctk
 
 from process_zero_balance import detect_fund_matching, detect_non_tax_verification, detect_settlement_refund_matching
 from generate_report import batch_generate
-from preprocess import preprocess_transactions, preprocess_transactions_folder, detect_end_of_day_nonzero
+from preprocess import (
+    preprocess_transactions,
+    preprocess_transactions_folder,
+    detect_finance_account_verification,
+    detect_end_of_day_nonzero,
+)
 from logger import setup_logging, log_message, get_log_path
 
 # ── 外观设置 ──
@@ -119,6 +124,9 @@ class App(ctk.CTk):
         self.preprocess_folder_input = ctk.StringVar(value="")
         self.preprocess_output_path = ctk.StringVar(value="")
 
+        # ── 财政专户校验 ──
+        self.finance_account_file_path = ctk.StringVar(value="")
+
         # ── 延迟清算 ──
         self.delayed_settlement_input = ctk.StringVar(value="")
         self.delayed_settlement_output = ctk.StringVar(value="")
@@ -140,6 +148,7 @@ class App(ctk.CTk):
         self.running = False
         self.running_nt = False
         self.running_sc = False
+        self.running_finance = False
 
         # 并行控制
         self.max_workers = ctk.StringVar(value="1")
@@ -200,12 +209,14 @@ class App(ctk.CTk):
         self.tab_non_tax = self.tabview.add("非税收入")
         self.tab_report = self.tabview.add("文书生成")
         self.tab_preprocess = self.tabview.add("流水预处理")
+        self.tab_finance = self.tabview.add("财政专户校验")
 
         # 为每个标签页构建内容
         self._build_tab_clear()
         self._build_tab_non_tax()
         self._build_tab_report()
         self._build_tab_preprocess()
+        self._build_tab_finance()
 
         # ── 日志标签 ──
         log_label = ctk.CTkLabel(
@@ -686,6 +697,92 @@ class App(ctk.CTk):
         self.run_delayed_btn.grid(row=r, column=0, columnspan=3, sticky="ew",
                                   padx=12, pady=(14, 12))
         r += 1
+
+    # ── 标签页5: 财政专户校验 ──
+
+    def _build_tab_finance(self):
+        tab = self.tab_finance
+        LW = self.LABEL_W
+        tab.grid_columnconfigure(1, weight=1)
+
+        r = 0
+        ctk.CTkLabel(tab, text="📂 财政专户校验",
+                     font=ctk.CTkFont(size=15, weight="bold")
+                     ).grid(row=r, column=0, columnspan=3, sticky="w", pady=(14, 4), padx=(12, 0))
+        r += 1
+
+        ctk.CTkLabel(tab,
+                     text="筛选对方户名包含待报解/待结算/非税收入/暂收款/暂付款的交易，按对方户名汇总数量",
+                     font=ctk.CTkFont(size=11), text_color="gray",
+                     wraplength=600, justify="left"
+                     ).grid(row=r, column=0, columnspan=3, sticky="w", padx=(12, 0), pady=(0, 8))
+        r += 1
+
+        row_f = ctk.CTkFrame(tab, fg_color="transparent")
+        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
+        row_f.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(row_f, text="流水文件/文件夹", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkEntry(row_f, textvariable=self.finance_account_file_path,
+                     placeholder_text="选择单个流水文件或包含多个流水文件的文件夹...").grid(
+            row=0, column=1, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(row_f, text="浏览", width=64,
+                       command=lambda: self._browse_file(self.finance_account_file_path)
+                       ).grid(row=0, column=2, padx=(0, 4))
+        ctk.CTkButton(row_f, text="目录", width=64,
+                       command=lambda: self._browse_directory(self.finance_account_file_path)
+                       ).grid(row=0, column=3, padx=(0, 6))
+        r += 1
+
+        self.run_finance_btn = ctk.CTkButton(
+            tab, text="▶  开始校验",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            height=44, corner_radius=8,
+            command=self._run_finance_account,
+        )
+        self.run_finance_btn.grid(row=r, column=0, columnspan=3, sticky="ew",
+                                  padx=12, pady=(20, 12))
+        r += 1
+
+    def _run_finance_account(self):
+        if self.running_finance:
+            return
+        file_path = self.finance_account_file_path.get().strip()
+        if not file_path or not os.path.exists(file_path):
+            self._log_error(f"流水文件/文件夹不存在: {file_path}")
+            return
+
+        self.running_finance = True
+        self.run_finance_btn.configure(text="⏳  校验中...", state="disabled")
+        thread = threading.Thread(target=self._finance_account_worker, daemon=True)
+        thread.start()
+
+    def _finance_account_worker(self):
+        try:
+            self._run_finance_account_internal()
+        except Exception as e:
+            self._log_error(f"财政专户校验出错: {e}")
+            import traceback
+            self._log_error(traceback.format_exc())
+        finally:
+            self.running_finance = False
+            self.after(0, lambda: self.run_finance_btn.configure(
+                text="▶  开始校验", state="normal"))
+
+    def _run_finance_account_internal(self):
+        file_path = self.finance_account_file_path.get().strip()
+        out_dir = self.output_dir.get()
+        os.makedirs(out_dir, exist_ok=True)
+        output_path = os.path.join(out_dir, "财政专户校验结果.xlsx")
+
+        self._log_step("═══ 财政专户校验 ═══")
+        self._log_result(f"  流水文件/文件夹: {file_path}")
+        results = detect_finance_account_verification(file_path)
+        results.to_excel(output_path, index=False)
+        self._log_result(f"  匹配对方户名数: {len(results)}")
+        self._log_result(f"  匹配交易笔数: {int(results['交易笔数'].sum()) if len(results) > 0 else 0}")
+        self._log_success(f"财政专户校验结果已保存: {output_path}")
+        self._log_step("═══════════════════════════════")
+        self._log_success("财政专户校验完成！")
 
     # ── 文件选择（另存为） ──
 
@@ -1242,30 +1339,51 @@ class App(ctk.CTk):
         base_name = os.path.splitext(os.path.basename(file_path))[0]
         overdue_path = os.path.join(out_dir, f"{base_name}_超期匹配.xlsx")
         unmatched_path = os.path.join(out_dir, f"{base_name}_未匹配.xlsx")
+        interval_path = os.path.join(out_dir, f"{base_name}_日期间隔异常.xlsx")
         overdue_df = results.get('overdue', pd.DataFrame())
         unmatched_df = results.get('unmatched', pd.DataFrame())
         overdue_columns = [
-            '文件来源', '账号', '来源日期', '来源金额', '摘要',
-            '对方账号', '来账对方户名', '匹配日期', '匹配金额',
-            '窗口截止', '窗口工作日', '状态', '清算日期',
+            '文件来源', '账号', '来源金额', '摘要',
+            '对方账号', '来账对方户名', '匹配金额',
+            '窗口截止', '窗口工作日', '状态', '日期间隔',
+            '清算日期', '退至垫款户日期', '退至国库日期',
         ]
         unmatched_columns = [
-            '文件来源', '账号', '来源日期', '来源金额', '摘要',
-            '对方账号', '来账对方户名', '匹配日期', '匹配金额',
+            '文件来源', '账号', '来源金额', '摘要',
+            '对方账号', '来账对方户名', '匹配金额',
             '窗口截止', '窗口工作日', '状态',
+            '清算日期', '退至垫款户日期', '退至国库日期',
         ]
 
-        pd.DataFrame(overdue_df if len(overdue_df) else None, columns=overdue_columns).to_excel(
+        overdue_save = overdue_df.rename(columns={
+            '来源日期': '退至垫款户日期',
+            '匹配日期': '退至国库日期',
+        }).copy()
+        if len(overdue_save) > 0:
+            overdue_save['日期间隔'] = pd.to_numeric(overdue_save['日期间隔'], errors='coerce')
+        unmatched_save = unmatched_df.rename(columns={
+            '来源日期': '退至垫款户日期',
+            '匹配日期': '退至国库日期',
+        }).copy()
+        if len(unmatched_save) > 0:
+            unmatched_save['清算日期'] = ''
+        pd.DataFrame(overdue_save if len(overdue_save) else None, columns=overdue_columns).to_excel(
             overdue_path, index=False
         )
-        pd.DataFrame(unmatched_df if len(unmatched_df) else None, columns=unmatched_columns).to_excel(
+        pd.DataFrame(unmatched_save if len(unmatched_save) else None, columns=unmatched_columns).to_excel(
             unmatched_path, index=False
+        )
+        interval_save = overdue_save[overdue_save['日期间隔'] > 1].copy() if len(overdue_save) > 0 else pd.DataFrame()
+        pd.DataFrame(interval_save if len(interval_save) else None, columns=overdue_columns).to_excel(
+            interval_path, index=False
         )
         self._log_result(f"  窗口内匹配: {results.get('matched', 0)}")
         self._log_result(f"  超期匹配记录数: {len(overdue_df)}")
         self._log_result(f"  未匹配记录数: {len(unmatched_df)}")
+        self._log_result(f"  日期间隔异常记录数: {len(interval_save)}")
         self._log_success(f"超期匹配结果已保存: {overdue_path}")
         self._log_success(f"未匹配结果已保存: {unmatched_path}")
+        self._log_success(f"日期间隔异常结果已保存: {interval_path}")
         self._log_step("═══════════════════════════════")
         self._log_success("清算退款确认完成！")
 
