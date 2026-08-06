@@ -2399,6 +2399,8 @@ def detect_settlement_refund_full_matching(
     for zero in zero_records:
         if zero['amount'] <= 0:
             continue
+        if '财政零余额' in zero['counterparty_name'] or '垫款' in zero['counterparty_name']:
+            continue
         zero_refund = zero
         zero_day = zero_refund['date'].date() if isinstance(zero_refund['date'], datetime) else zero_refund['date']
 
