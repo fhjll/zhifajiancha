@@ -1438,8 +1438,14 @@ class App(ctk.CTk):
             zero_folder=zero_folder,
             confirm_file=confirm_path,
             output_path=output_path,
+            unmatched_2302_output_path=os.path.join(out_dir, "未匹配2302明细.xlsx"),
+            unmatched_2301_output_path=os.path.join(out_dir, "未匹配2301明细.xlsx"),
+            unmatched_clearing_output_path=os.path.join(out_dir, "未匹配清算记录.xlsx"),
         )
         self._log_result(f"  异常记录数: {len(results)}")
+        self._log_result("  未匹配2302明细已保存: " + os.path.join(out_dir, "未匹配2302明细.xlsx"))
+        self._log_result("  未匹配2301明细（如有）: " + os.path.join(out_dir, "未匹配2301明细.xlsx"))
+        self._log_result("  未匹配清算记录（如有）: " + os.path.join(out_dir, "未匹配清算记录.xlsx"))
         self._log_success(f"清算退款异常结果已保存: {output_path}")
         self._log_step("═══════════════════════════════")
         self._log_success("清算退款检查完成！")
