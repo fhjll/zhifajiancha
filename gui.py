@@ -23,6 +23,7 @@ from process_zero_balance import (
     detect_non_tax_verification,
     detect_settlement_refund_matching,
     detect_interval_anomalies_from_overdue_folder,
+    detect_settlement_refund_full_matching,
 )
 from generate_report import batch_generate
 from preprocess import (
@@ -119,7 +120,8 @@ class App(ctk.CTk):
         self.non_tax_mode = ctk.StringVar(value="zhankuan")
 
         # 清算退款确认
-        self.settlement_check_file = ctk.StringVar(value="")
+        self.settlement_zero_folder = ctk.StringVar(value="")
+        self.settlement_qing_folder = ctk.StringVar(value="")
         self.settlement_check_account = ctk.StringVar(value="待报解预算收入")
         self.settlement_check_days = ctk.StringVar(value="2")
         self.settlement_confirm_file = ctk.StringVar(value="")
@@ -354,61 +356,63 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(size=1)).grid(row=r, column=0, columnspan=3)
         r += 1
 
-        ctk.CTkLabel(tab, text="🔍 清算退款确认（逐笔匹配确认CSV）",
+        ctk.CTkLabel(tab, text="🔍 清算退款检查（全链路）",
                      font=ctk.CTkFont(size=14, weight="bold")
                      ).grid(row=r, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=(12, 0))
         r += 1
 
-        # 流水文件
+        # 零余额单位流水文件夹
         row_f = ctk.CTkFrame(tab, fg_color="transparent")
         row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
         row_f.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(row_f, text="流水文件", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
-        ctk.CTkEntry(row_f, textvariable=self.settlement_check_file,
-                     placeholder_text="选择需要核查的流水文件...").grid(
+        ctk.CTkLabel(row_f, text="零余额账户", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkEntry(row_f, textvariable=self.settlement_zero_folder,
+                     placeholder_text="选择零余额单位流水文件夹...").grid(
             row=0, column=1, sticky="ew", padx=(0, 8))
-        ctk.CTkButton(row_f, text="浏览", width=64,
-                       command=lambda: self._browse_file(self.settlement_check_file)
+        ctk.CTkButton(row_f, text="目录", width=64,
+                       command=lambda: self._browse_directory(self.settlement_zero_folder)
                        ).grid(row=0, column=2, padx=(0, 6))
         r += 1
 
-        # 二次确认 CSV
+        # 垫款户流水文件夹
         row_f = ctk.CTkFrame(tab, fg_color="transparent")
         row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
         row_f.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(row_f, text="确认CSV", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkLabel(row_f, text="垫款户", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkEntry(row_f, textvariable=self.settlement_qing_folder,
+                     placeholder_text="选择垫款户流水文件夹...").grid(
+            row=0, column=1, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(row_f, text="目录", width=64,
+                       command=lambda: self._browse_directory(self.settlement_qing_folder)
+                       ).grid(row=0, column=2, padx=(0, 6))
+        r += 1
+
+        # 明细 CSV
+        row_f = ctk.CTkFrame(tab, fg_color="transparent")
+        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
+        row_f.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(row_f, text="明细CSV", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
         ctk.CTkEntry(row_f, textvariable=self.settlement_confirm_file,
-                     placeholder_text="必选：凭证类型编号2302确认文件...").grid(
+                     placeholder_text="选择包含2301/2302明细的确认CSV...").grid(
             row=0, column=1, sticky="ew", padx=(0, 8))
         ctk.CTkButton(row_f, text="浏览", width=64,
                        command=lambda: self._browse_file(self.settlement_confirm_file)
                        ).grid(row=0, column=2, padx=(0, 6))
         r += 1
 
-        # 目标账户
+        # 指定账户
         row_f = ctk.CTkFrame(tab, fg_color="transparent")
         row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
         row_f.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(row_f, text="目标账户", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkLabel(row_f, text="指定账户", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
         ctk.CTkEntry(row_f, textvariable=self.settlement_check_account,
                      placeholder_text="多账户用逗号分隔，如: 待报解预算收入,国库经收处").grid(
             row=0, column=1, columnspan=2, sticky="ew", padx=(0, 6))
         r += 1
 
-        # 匹配窗口
-        row_f = ctk.CTkFrame(tab, fg_color="transparent")
-        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
-        ctk.CTkLabel(row_f, text="窗口工作日", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
-        ctk.CTkEntry(row_f, textvariable=self.settlement_check_days, width=60).grid(
-            row=0, column=1, sticky="w")
-        ctk.CTkLabel(row_f, text="两个工作日内未匹配即视为可疑（跳过节假日）",
-                     text_color="gray", font=ctk.CTkFont(size=11)).grid(
-            row=0, column=2, sticky="w")
-        r += 1
-
         # 运行按钮
         self.run_sc_btn = ctk.CTkButton(
-            tab, text="▶  清算退款确认",
+            tab, text="▶  清算退款检查",
             font=ctk.CTkFont(size=15, weight="bold"),
             height=38, corner_radius=8,
             command=self._run_settlement_check,
@@ -1408,15 +1412,23 @@ class App(ctk.CTk):
         self._log_step("═══════════════════════════════")
         self._log_success("非税核查完成！")
 
-    # ──────────── 清算退款确认（逐笔匹配） ────────────
+    # ──────────── 清算退款检查（全链路） ────────────
 
     def _run_settlement_check(self):
         if self.running_sc:
             return
 
-        file_path = self.settlement_check_file.get().strip()
-        if not file_path or not os.path.exists(file_path):
-            self._log_error(f"流水文件不存在: {file_path}")
+        zero_folder = self.settlement_zero_folder.get().strip()
+        qing_folder = self.settlement_qing_folder.get().strip()
+        confirm_path = self.settlement_confirm_file.get().strip()
+        if not zero_folder or not os.path.exists(zero_folder):
+            self._log_error(f"零余额账户文件夹不存在: {zero_folder}")
+            return
+        if not qing_folder or not os.path.exists(qing_folder):
+            self._log_error(f"垫款户文件夹不存在: {qing_folder}")
+            return
+        if not confirm_path or not os.path.exists(confirm_path):
+            self._log_error(f"明细CSV不存在: {confirm_path}")
             return
 
         self.running_sc = True
@@ -1429,95 +1441,43 @@ class App(ctk.CTk):
         try:
             self._run_settlement_check_internal()
         except Exception as e:
-            self._log_error(f"清算退款确认出错: {e}")
+            self._log_error(f"清算退款检查出错: {e}")
             import traceback
             self._log_error(traceback.format_exc())
         finally:
             self.running_sc = False
             self.after(0, lambda: self.run_sc_btn.configure(
-                text="▶  清算退款确认", state="normal"))
+                text="▶  清算退款检查", state="normal"))
 
     def _run_settlement_check_internal(self):
-        file_path = self.settlement_check_file.get().strip()
+        zero_folder = self.settlement_zero_folder.get().strip()
+        qing_folder = self.settlement_qing_folder.get().strip()
         confirm_path = self.settlement_confirm_file.get().strip()
-        if not confirm_path:
-            self._log_error("清算退款确认需要选择确认CSV")
-            return
-        if not os.path.exists(confirm_path):
-            self._log_error(f"确认CSV不存在: {confirm_path}")
-            return
-        try:
-            threshold = int(self.settlement_check_days.get())
-        except ValueError:
-            threshold = 2
-
         out_dir = self.output_dir.get()
         os.makedirs(out_dir, exist_ok=True)
+        output_path = os.path.join(out_dir, "清算退款异常结果.xlsx")
 
-        self._log_step("═══ 清算退款确认：逐笔匹配 ═══")
-        self._log_result(f"  流水文件: {file_path}")
-        self._log_result(f"  确认CSV: {confirm_path}")
+        self._log_step("═══ 清算退款检查：全链路匹配 ═══")
+        self._log_result(f"  零余额账户文件夹: {zero_folder}")
+        self._log_result(f"  垫款户文件夹: {qing_folder}")
+        self._log_result(f"  明细CSV: {confirm_path}")
         account_name = self.settlement_check_account.get().strip() or "待报解预算收入"
-        self._log_result(f"  目标账户: {account_name}")
-        self._log_result(f"  窗口工作日: {threshold}")
+        advance_name = self.advance_acct_name.get().strip() or "集中支付零余额清算待转"
+        self._log_result(f"  指定账户: {account_name}")
+        self._log_result(f"  垫款户名称: {advance_name}")
 
-        results = detect_settlement_refund_matching(
-            file_path=file_path,
-            designated_account=_parse_multi_account(account_name),
-            days_threshold=threshold,
-            confirm_file_path=confirm_path,
+        results = detect_settlement_refund_full_matching(
+            zero_folder=zero_folder,
+            qing_folder=qing_folder,
+            confirm_file=confirm_path,
+            designated_account=account_name,
+            advance_acct_name=advance_name,
+            output_path=output_path,
         )
-
-        base_name = os.path.splitext(os.path.basename(file_path))[0]
-        overdue_path = os.path.join(out_dir, f"{base_name}_超期匹配.xlsx")
-        unmatched_path = os.path.join(out_dir, f"{base_name}_未匹配.xlsx")
-        interval_path = os.path.join(out_dir, f"{base_name}_日期间隔异常.xlsx")
-        overdue_df = results.get('overdue', pd.DataFrame())
-        unmatched_df = results.get('unmatched', pd.DataFrame())
-        overdue_columns = [
-            '文件来源', '账号', '来源金额', '摘要',
-            '对方账号', '来账对方户名', '匹配金额',
-            '窗口截止', '窗口工作日', '状态', '日期间隔',
-            '清算日期', '退至垫款户日期', '退至国库日期',
-        ]
-        unmatched_columns = [
-            '文件来源', '账号', '来源金额', '摘要',
-            '对方账号', '来账对方户名', '匹配金额',
-            '窗口截止', '窗口工作日', '状态',
-            '清算日期', '退至垫款户日期', '退至国库日期',
-        ]
-
-        overdue_save = overdue_df.rename(columns={
-            '来源日期': '退至垫款户日期',
-            '匹配日期': '退至国库日期',
-        }).copy()
-        if len(overdue_save) > 0:
-            overdue_save['日期间隔'] = pd.to_numeric(overdue_save['日期间隔'], errors='coerce')
-        unmatched_save = unmatched_df.rename(columns={
-            '来源日期': '退至垫款户日期',
-            '匹配日期': '退至国库日期',
-        }).copy()
-        if len(unmatched_save) > 0:
-            unmatched_save['清算日期'] = ''
-        pd.DataFrame(overdue_save if len(overdue_save) else None, columns=overdue_columns).to_excel(
-            overdue_path, index=False
-        )
-        pd.DataFrame(unmatched_save if len(unmatched_save) else None, columns=unmatched_columns).to_excel(
-            unmatched_path, index=False
-        )
-        interval_save = overdue_save[overdue_save['日期间隔'] > 1].copy() if len(overdue_save) > 0 else pd.DataFrame()
-        pd.DataFrame(interval_save if len(interval_save) else None, columns=overdue_columns).to_excel(
-            interval_path, index=False
-        )
-        self._log_result(f"  窗口内匹配: {results.get('matched', 0)}")
-        self._log_result(f"  超期匹配记录数: {len(overdue_df)}")
-        self._log_result(f"  未匹配记录数: {len(unmatched_df)}")
-        self._log_result(f"  日期间隔异常记录数: {len(interval_save)}")
-        self._log_success(f"超期匹配结果已保存: {overdue_path}")
-        self._log_success(f"未匹配结果已保存: {unmatched_path}")
-        self._log_success(f"日期间隔异常结果已保存: {interval_path}")
+        self._log_result(f"  异常记录数: {len(results)}")
+        self._log_success(f"清算退款异常结果已保存: {output_path}")
         self._log_step("═══════════════════════════════")
-        self._log_success("清算退款确认完成！")
+        self._log_success("清算退款检查完成！")
 
     # ──────────── 文书生成 ────────────
 
