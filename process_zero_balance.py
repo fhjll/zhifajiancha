@@ -2171,8 +2171,8 @@ def detect_interval_anomalies_from_overdue_folder(
     从确认 CSV 重新匹配 2301 清算日期，遍历超期匹配结果文件，
     汇总日期间隔大于 1 个工作日的记录。
     """
-    confirm_2302 = _load_settlement_confirm_csv(confirm_file_path, voucher_code='2302')
-    confirm_2301 = _load_settlement_confirm_csv(confirm_file_path, voucher_code='2301')
+    confirm_2302 = _load_settlement_confirm_records(confirm_file_path, voucher_code='2302')
+    confirm_2301 = _load_settlement_confirm_records(confirm_file_path, voucher_code='2301')
 
     by_2302 = {}
     for _, row in confirm_2302.iterrows():
@@ -2316,6 +2316,11 @@ def _load_flow_folder_records(folder, kind='zero'):
             amount = row.get('交易金额', 0)
             if pd.isna(amount):
                 continue
+            bank = ''
+            for c in ('开户行', '开户银行', '对方行名', '开户行名称'):
+                if c in df.columns:
+                    bank = str(row.get(c, '') or '').strip()
+                    break
             records.append({
                 'file_name': file_label,
                 'account': account,
@@ -2326,6 +2331,7 @@ def _load_flow_folder_records(folder, kind='zero'):
                 'counterparty_account': _normalize_confirm_account_value(row.get('对方账号', '')),
                 'summary': str(row.get('摘要', '') or '').strip(),
                 'debit_flag': row.get('借贷标志', None),
+                'bank': bank,
             })
     return records
 
@@ -2338,20 +2344,59 @@ def _amount_matches_refund(confirm_amount, refund_amount):
     return round(abs(confirm_amount * 100)) == round(abs(refund_amount))
 
 
+_DESIGNATED_NAME_KEYWORDS = ('财政局', '保工资', '超长期国债', '非税收入')
+_ADVANCE_NAME_KEYWORD = '财政零余额账户垫款'
+
+
+def _auto_detect_designated_accounts(records):
+    """根据户名和开户行自动识别指定账户。"""
+    names = set()
+    for rec in records:
+        name = rec['counterparty_name']
+        bank = rec.get('bank', '')
+        if any(keyword in name for keyword in _DESIGNATED_NAME_KEYWORDS):
+            if not bank or '国家金库' in bank:
+                names.add(name)
+    return names
+
+
+def _auto_detect_advance_accounts(zero_records, qing_records):
+    """根据户名/文件名自动识别垫款户。"""
+    names = set()
+    all_records = list(zero_records) + list(qing_records)
+    for rec in all_records:
+        if _ADVANCE_NAME_KEYWORD in rec['counterparty_name']:
+            names.add(rec['counterparty_name'])
+    for folder_records in (zero_records, qing_records):
+        for rec in folder_records:
+            if _ADVANCE_NAME_KEYWORD in rec['file_name']:
+                names.add(rec['counterparty_name'])
+    return names
+
+
+def _is_advance_counterparty(name, advance_names):
+    if not name:
+        return False
+    if any(advance_name in name for advance_name in advance_names):
+        return True
+    return _ADVANCE_NAME_KEYWORD in name
+
+
 def detect_settlement_refund_full_matching(
     zero_folder,
     qing_folder,
     confirm_file,
     designated_account='待报解预算收入',
     advance_acct_name='集中支付零余额清算待转',
+    auto_detect=True,
     output_path=None,
 ):
     """
     零余额账户 + 垫款户 + 明细CSV 全链路清算退款检查。
     返回日期间隔异常的汇总结果，并可保存到 output_path。
     """
-    confirm_2302 = _load_settlement_confirm_csv(confirm_file, voucher_code='2302')
-    confirm_2301 = _load_settlement_confirm_csv(confirm_file, voucher_code='2301')
+    confirm_2302 = _load_settlement_confirm_records(confirm_file, voucher_code='2302')
+    confirm_2301 = _load_settlement_confirm_records(confirm_file, voucher_code='2301')
     zero_records = _load_flow_folder_records(zero_folder, 'zero')
     qing_records = _load_flow_folder_records(qing_folder, 'qing')
 
@@ -2360,10 +2405,22 @@ def detect_settlement_refund_full_matching(
         for x in str(designated_account).replace('，', ',').split(',')
         if x.strip()
     }
+    advance_names = {
+        _normalize_confirm_text_value(x)
+        for x in str(advance_acct_name).replace('，', ',').split(',')
+        if x.strip()
+    }
+    if auto_detect:
+        designated_names.update(_auto_detect_designated_accounts(zero_records))
+        advance_names.update(_auto_detect_advance_accounts(zero_records, qing_records))
+        if designated_names:
+            print(f"[清算退款检查] 自动识别指定账户: {designated_names}")
+        if advance_names:
+            print(f"[清算退款检查] 自动识别垫款户: {advance_names}")
 
     results = []
     for zero in zero_records:
-        if zero['counterparty_name'] in designated_names:
+        if _is_advance_counterparty(zero['counterparty_name'], advance_names):
             continue
         if zero['amount'] <= 0:
             continue
@@ -2378,7 +2435,10 @@ def detect_settlement_refund_full_matching(
                 continue
             if abs(candidate['amount']) != abs(zero_refund['amount']):
                 continue
-            if advance_acct_name not in candidate['counterparty_name']:
+            if not any(
+                advance_name in candidate['counterparty_name']
+                for advance_name in advance_names
+            ):
                 continue
             if candidate['time'] <= zero_refund['time']:
                 continue
@@ -2577,12 +2637,19 @@ def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
         '入帐日期': '交易日期',
     }
     rename_map = {}
+    existing_targets = set(df.columns)
     for col in df.columns:
         clean_col = str(col).strip()
         if clean_col.startswith('\ufeff'):
             clean_col = clean_col[1:]
         if clean_col in alias_map:
-            rename_map[col] = alias_map[clean_col]
+            target = alias_map[clean_col]
+            if target in existing_targets and target != clean_col:
+                continue
+            if target in rename_map.values():
+                continue
+            rename_map[col] = target
+            existing_targets.add(target)
     if rename_map:
         df = df.rename(columns=rename_map)
 
@@ -2605,9 +2672,14 @@ def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
     df['收款人账号'] = df['收款人账号'].map(_normalize_confirm_account_value)
     if '摘要' not in df.columns:
         df['摘要'] = ''
+    if isinstance(df['摘要'], pd.DataFrame):
+        df['摘要'] = df['摘要'].iloc[:, 0]
     df['摘要'] = df['摘要'].fillna('').astype(str).str.strip()
     if '汇总清算金额' in df.columns:
-        df['汇总清算金额'] = pd.to_numeric(df['汇总清算金额'], errors='coerce')
+        summary_col = df['汇总清算金额']
+        if isinstance(summary_col, pd.DataFrame):
+            summary_col = summary_col.iloc[:, 0]
+        df['汇总清算金额'] = pd.to_numeric(summary_col, errors='coerce')
     else:
         df['汇总清算金额'] = np.nan
     df['凭证类型编号'] = df['凭证类型编号'].map(_normalize_confirm_code_value)
@@ -2616,6 +2688,25 @@ def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
         df = df.loc[df['凭证类型编号'] == voucher_code].copy()
     df = df.dropna(subset=['发生额'])
     return df.sort_values('日期对象').reset_index(drop=True)
+
+
+def _load_settlement_confirm_records(path, voucher_code='2302'):
+    """加载单个明细 CSV 或文件夹中多个明细 CSV。"""
+    if os.path.isdir(path):
+        files = sorted(
+            os.path.join(path, name)
+            for name in os.listdir(path)
+            if os.path.splitext(name)[1].lower() in ('.csv', '.txt')
+        )
+        frames = [
+            _load_settlement_confirm_csv(f, voucher_code=voucher_code)
+            for f in files
+        ]
+        frames = [f for f in frames if len(f) > 0]
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+    return _load_settlement_confirm_csv(path, voucher_code=voucher_code)
 
 
 def confirm_settlement_suspicious(suspicious_df, confirm_file_path):
