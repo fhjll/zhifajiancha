@@ -2287,6 +2287,251 @@ def detect_interval_anomalies_from_overdue_folder(
     return result_df
 
 
+def _load_flow_folder_records(folder, kind='zero'):
+    """读取零余额或垫款户文件夹中的所有流水记录。"""
+    exts = ('.csv', '.txt', '.xlsx', '.xls')
+    files = sorted(
+        os.path.join(folder, name)
+        for name in os.listdir(folder)
+        if os.path.splitext(name)[1].lower() in exts
+    )
+    records = []
+    for filepath in files:
+        if kind == 'zero':
+            df = _load_zero_balance_flow_file(filepath)
+        else:
+            df = _load_qing_suan(filepath)
+        if len(df) == 0:
+            continue
+        file_label = os.path.basename(filepath)
+        account = ''
+        for c in ('账号', '帐号'):
+            if c in df.columns and len(df) > 0:
+                account = _normalize_confirm_account_value(df[c].iloc[0])
+                break
+        if not account:
+            account = _normalize_confirm_account_value(os.path.splitext(file_label)[0])
+
+        for _, row in df.iterrows():
+            amount = row.get('交易金额', 0)
+            if pd.isna(amount):
+                continue
+            records.append({
+                'file_name': file_label,
+                'account': account,
+                'date': row['日期对象'],
+                'time': row.get('时间对象', row['日期对象']),
+                'amount': float(amount),
+                'counterparty_name': _normalize_confirm_text_value(row.get('对方户名', '')),
+                'counterparty_account': _normalize_confirm_account_value(row.get('对方账号', '')),
+                'summary': str(row.get('摘要', '') or '').strip(),
+                'debit_flag': row.get('借贷标志', None),
+            })
+    return records
+
+
+def _amount_matches_refund(confirm_amount, refund_amount):
+    confirm_amount = _normalize_confirm_amount_value(confirm_amount)
+    refund_amount = _normalize_confirm_amount_value(refund_amount)
+    if confirm_amount is None or refund_amount is None:
+        return False
+    return round(abs(confirm_amount * 100)) == round(abs(refund_amount))
+
+
+def detect_settlement_refund_full_matching(
+    zero_folder,
+    qing_folder,
+    confirm_file,
+    designated_account='待报解预算收入',
+    advance_acct_name='集中支付零余额清算待转',
+    output_path=None,
+):
+    """
+    零余额账户 + 垫款户 + 明细CSV 全链路清算退款检查。
+    返回日期间隔异常的汇总结果，并可保存到 output_path。
+    """
+    confirm_2302 = _load_settlement_confirm_csv(confirm_file, voucher_code='2302')
+    confirm_2301 = _load_settlement_confirm_csv(confirm_file, voucher_code='2301')
+    zero_records = _load_flow_folder_records(zero_folder, 'zero')
+    qing_records = _load_flow_folder_records(qing_folder, 'qing')
+
+    designated_names = {
+        _normalize_confirm_text_value(x)
+        for x in str(designated_account).replace('，', ',').split(',')
+        if x.strip()
+    }
+
+    results = []
+    for zero in zero_records:
+        if zero['counterparty_name'] in designated_names:
+            continue
+        if zero['amount'] <= 0:
+            continue
+        zero_refund = zero
+
+        # 2. 同文件找退至垫款户支出
+        tui_zhuan = None
+        for candidate in zero_records:
+            if candidate['file_name'] != zero['file_name']:
+                continue
+            if candidate['amount'] >= 0:
+                continue
+            if abs(candidate['amount']) != abs(zero_refund['amount']):
+                continue
+            if advance_acct_name not in candidate['counterparty_name']:
+                continue
+            if candidate['time'] <= zero_refund['time']:
+                continue
+            if tui_zhuan is None or candidate['time'] < tui_zhuan['time']:
+                tui_zhuan = candidate
+        if tui_zhuan is None:
+            continue
+
+        # 3. 垫款户收款记录
+        qing_receive = None
+        for candidate in qing_records:
+            if candidate['amount'] <= 0:
+                continue
+            if abs(candidate['amount']) != abs(zero_refund['amount']):
+                continue
+            if zero_refund['account'] not in candidate['counterparty_account']:
+                continue
+            if candidate['date'].date() != tui_zhuan['date'].date():
+                continue
+            if qing_receive is None or candidate['time'] < qing_receive['time']:
+                qing_receive = candidate
+        if qing_receive is None:
+            continue
+
+        # 4. 划往金库记录
+        qing_gold = None
+        for candidate in qing_records:
+            if not _is_debit_flag(candidate['debit_flag']):
+                continue
+            if '财政授权支付退款' not in candidate['summary']:
+                continue
+            if abs(candidate['amount']) <= abs(qing_receive['amount']):
+                continue
+            if candidate['date'] < qing_receive['date']:
+                continue
+            if qing_gold is None or candidate['time'] < qing_gold['time']:
+                qing_gold = candidate
+        if qing_gold is None:
+            continue
+
+        # 5. 2302 明细
+        rec_2302 = None
+        for _, row in confirm_2302.iterrows():
+            if not _amount_matches_refund(row['发生额'], zero_refund['amount']):
+                continue
+            if _normalize_confirm_text_value(row['付款人名称']) != qing_receive['counterparty_name']:
+                continue
+            rec_2302 = row
+            break
+        if rec_2302 is None:
+            continue
+
+        # 6. 2301 明细
+        rec_2301 = None
+        for _, row in confirm_2301.iterrows():
+            if _normalize_confirm_text_value(row['付款人名称']) != _normalize_confirm_text_value(rec_2302['付款人名称']):
+                continue
+            if _normalize_confirm_account_value(row['付款人账号']) != _normalize_confirm_account_value(rec_2302['付款人账号']):
+                continue
+            if _normalize_confirm_text_value(row['收款人名称']) != _normalize_confirm_text_value(rec_2302['收款人名称']):
+                continue
+            if _normalize_confirm_account_value(row['收款人账号']) != _normalize_confirm_account_value(rec_2302['收款人账号']):
+                continue
+            if row['摘要'] != rec_2302['摘要']:
+                continue
+            if round(abs(row['发生额'] * 100)) != round(abs(rec_2302['发生额'] * 100)):
+                continue
+            if row['发生额'] <= 0 or rec_2302['发生额'] >= 0:
+                continue
+            rec_2301 = row
+            break
+        if rec_2301 is None:
+            continue
+
+        # 7. 2301 对应垫款户记录
+        qing_for_2301 = None
+        for candidate in qing_records:
+            summary_amount = _normalize_confirm_amount_value(rec_2301.get('汇总清算金额'))
+            if summary_amount is None:
+                continue
+            if abs(_normalize_confirm_amount_value(candidate['amount']) or 0) != abs(summary_amount):
+                continue
+            if candidate['date'].date() != rec_2301['日期对象'].date():
+                continue
+            qing_for_2301 = candidate
+            break
+        if qing_for_2301 is None:
+            continue
+
+        # 8. 零余额账户垫款记录
+        advance_record = None
+        for candidate in zero_records:
+            if candidate['amount'] >= 0:
+                continue
+            if round(abs(candidate['amount'])) != round(abs(_normalize_confirm_amount_value(rec_2301['发生额']) or 0) * 100):
+                continue
+            if candidate['counterparty_name'] != _normalize_confirm_text_value(rec_2301['收款人名称']):
+                continue
+            if candidate['date'] > qing_for_2301['date']:
+                continue
+            if advance_record is None or candidate['time'] > advance_record['time']:
+                advance_record = candidate
+        if advance_record is None:
+            continue
+
+        clearing_date = rec_2301['日期对象']
+        zero_date = zero_refund['date']
+        tui_zhuan_date = tui_zhuan['date']
+        gold_date = qing_gold['date']
+        advance_date = advance_record['date']
+
+        interval1 = working_days_between(
+            max(clearing_date, zero_date, tui_zhuan_date).date(),
+            gold_date.date(),
+        )
+        interval2 = working_days_between(zero_date.date(), tui_zhuan_date.date())
+        if interval1 <= 1 and interval2 <= 1:
+            continue
+
+        results.append({
+            '零余额单位流水文件名称': zero_refund['file_name'],
+            '垫款户流水文件名称': qing_gold['file_name'],
+            '清算日期': clearing_date.strftime('%Y-%m-%d'),
+            '退至零余额日期': zero_date.strftime('%Y-%m-%d'),
+            '退至垫款户日期': tui_zhuan_date.strftime('%Y-%m-%d'),
+            '退至金库日期': gold_date.strftime('%Y-%m-%d'),
+            '垫款日期': advance_date.strftime('%Y-%m-%d'),
+            '金额': zero_refund['amount'],
+            '零余额账户收款人名称': zero_refund['counterparty_name'],
+            '垫款户收款人名称': qing_receive['counterparty_name'],
+            '清算交易对方收款人名称': rec_2301['收款人名称'],
+        })
+
+    columns = [
+        '零余额单位流水文件名称',
+        '垫款户流水文件名称',
+        '清算日期',
+        '退至零余额日期',
+        '退至垫款户日期',
+        '退至金库日期',
+        '垫款日期',
+        '金额',
+        '零余额账户收款人名称',
+        '垫款户收款人名称',
+        '清算交易对方收款人名称',
+    ]
+    result_df = pd.DataFrame(results, columns=columns)
+    if output_path is not None:
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        result_df.to_excel(output_path, index=False)
+    return result_df
+
+
 def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
     """加载二次确认 CSV，按凭证类型编号筛选记录。"""
     if not _is_csv_file(filepath):
@@ -2310,6 +2555,8 @@ def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
         '摘要名称': '摘要',
         '摘要': '摘要',
         '摘要信息': '摘要',
+        '汇总清算金额': '汇总清算金额',
+        '汇总金额': '汇总清算金额',
         '凭证类型': '凭证类型编号',
         '凭证类型编号': '凭证类型编号',
         '票据类型': '凭证类型编号',
@@ -2359,6 +2606,10 @@ def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
     if '摘要' not in df.columns:
         df['摘要'] = ''
     df['摘要'] = df['摘要'].fillna('').astype(str).str.strip()
+    if '汇总清算金额' in df.columns:
+        df['汇总清算金额'] = pd.to_numeric(df['汇总清算金额'], errors='coerce')
+    else:
+        df['汇总清算金额'] = np.nan
     df['凭证类型编号'] = df['凭证类型编号'].map(_normalize_confirm_code_value)
     df['发生额'] = df['发生额'].map(_normalize_confirm_amount_value)
     if voucher_code:
