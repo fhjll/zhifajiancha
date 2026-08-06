@@ -2384,114 +2384,40 @@ def _is_advance_counterparty(name, advance_names):
 
 def detect_settlement_refund_full_matching(
     zero_folder,
-    qing_folder,
     confirm_file,
-    designated_account='待报解预算收入',
-    advance_acct_name='集中支付零余额清算待转',
-    auto_detect=True,
     output_path=None,
 ):
     """
-    零余额账户 + 垫款户 + 明细CSV 全链路清算退款检查。
-    返回日期间隔异常的汇总结果，并可保存到 output_path。
+    零余额账户 + 明细CSV 清算退款检查。
+    通过零余额账户来账匹配 2302，再匹配 2301 和垫款记录，输出日期间隔异常。
     """
     confirm_2302 = _load_settlement_confirm_records(confirm_file, voucher_code='2302')
     confirm_2301 = _load_settlement_confirm_records(confirm_file, voucher_code='2301')
     zero_records = _load_flow_folder_records(zero_folder, 'zero')
-    qing_records = _load_flow_folder_records(qing_folder, 'qing')
-
-    designated_names = {
-        _normalize_confirm_text_value(x)
-        for x in str(designated_account).replace('，', ',').split(',')
-        if x.strip()
-    }
-    advance_names = {
-        _normalize_confirm_text_value(x)
-        for x in str(advance_acct_name).replace('，', ',').split(',')
-        if x.strip()
-    }
-    if auto_detect:
-        designated_names.update(_auto_detect_designated_accounts(zero_records))
-        advance_names.update(_auto_detect_advance_accounts(zero_records, qing_records))
-        if designated_names:
-            print(f"[清算退款检查] 自动识别指定账户: {designated_names}")
-        if advance_names:
-            print(f"[清算退款检查] 自动识别垫款户: {advance_names}")
 
     results = []
     for zero in zero_records:
-        if _is_advance_counterparty(zero['counterparty_name'], advance_names):
-            continue
         if zero['amount'] <= 0:
             continue
         zero_refund = zero
+        zero_day = zero_refund['date'].date() if isinstance(zero_refund['date'], datetime) else zero_refund['date']
 
-        # 2. 同文件找退至垫款户支出
-        tui_zhuan = None
-        for candidate in zero_records:
-            if candidate['file_name'] != zero['file_name']:
-                continue
-            if candidate['amount'] >= 0:
-                continue
-            if abs(candidate['amount']) != abs(zero_refund['amount']):
-                continue
-            if not any(
-                advance_name in candidate['counterparty_name']
-                for advance_name in advance_names
-            ):
-                continue
-            if candidate['time'] <= zero_refund['time']:
-                continue
-            if tui_zhuan is None or candidate['time'] < tui_zhuan['time']:
-                tui_zhuan = candidate
-        if tui_zhuan is None:
-            continue
-
-        # 3. 垫款户收款记录
-        qing_receive = None
-        for candidate in qing_records:
-            if candidate['amount'] <= 0:
-                continue
-            if abs(candidate['amount']) != abs(zero_refund['amount']):
-                continue
-            if zero_refund['account'] not in candidate['counterparty_account']:
-                continue
-            if candidate['date'].date() != tui_zhuan['date'].date():
-                continue
-            if qing_receive is None or candidate['time'] < qing_receive['time']:
-                qing_receive = candidate
-        if qing_receive is None:
-            continue
-
-        # 4. 划往金库记录
-        qing_gold = None
-        for candidate in qing_records:
-            if not _is_debit_flag(candidate['debit_flag']):
-                continue
-            if '财政授权支付退款' not in candidate['summary']:
-                continue
-            if abs(candidate['amount']) <= abs(qing_receive['amount']):
-                continue
-            if candidate['date'] < qing_receive['date']:
-                continue
-            if qing_gold is None or candidate['time'] < qing_gold['time']:
-                qing_gold = candidate
-        if qing_gold is None:
-            continue
-
-        # 5. 2302 明细
+        # 2302 明细：根据对方账号和金额匹配，退至国库日期取 2302 日期
         rec_2302 = None
         for _, row in confirm_2302.iterrows():
             if not _amount_matches_refund(row['发生额'], zero_refund['amount']):
                 continue
-            if _normalize_confirm_text_value(row['付款人名称']) != qing_receive['counterparty_name']:
+            if _normalize_confirm_account_value(row['收款人账号']) != zero_refund['counterparty_account']:
                 continue
-            rec_2302 = row
-            break
+            if row['日期对象'].date() < zero_day:
+                continue
+            if rec_2302 is None or row['日期对象'].date() < rec_2302['日期对象'].date():
+                rec_2302 = row
         if rec_2302 is None:
             continue
+        gold_date = rec_2302['日期对象']
 
-        # 6. 2301 明细
+        # 2301 明细：在退至国库日期之前匹配，清算日期取 2301 日期
         rec_2301 = None
         for _, row in confirm_2301.iterrows():
             if _normalize_confirm_text_value(row['付款人名称']) != _normalize_confirm_text_value(rec_2302['付款人名称']):
@@ -2508,27 +2434,15 @@ def detect_settlement_refund_full_matching(
                 continue
             if row['发生额'] <= 0 or rec_2302['发生额'] >= 0:
                 continue
-            rec_2301 = row
-            break
+            if row['日期对象'].date() >= gold_date.date():
+                continue
+            if rec_2301 is None or row['日期对象'].date() > rec_2301['日期对象'].date():
+                rec_2301 = row
         if rec_2301 is None:
             continue
+        clearing_date = rec_2301['日期对象']
 
-        # 7. 2301 对应垫款户记录
-        qing_for_2301 = None
-        for candidate in qing_records:
-            summary_amount = _normalize_confirm_amount_value(rec_2301.get('汇总清算金额'))
-            if summary_amount is None:
-                continue
-            if abs(_normalize_confirm_amount_value(candidate['amount']) or 0) != abs(summary_amount):
-                continue
-            if candidate['date'].date() != rec_2301['日期对象'].date():
-                continue
-            qing_for_2301 = candidate
-            break
-        if qing_for_2301 is None:
-            continue
-
-        # 8. 零余额账户垫款记录
+        # 垫款记录：2301 收款人/收款账号/支付金额(元) 匹配零余额账户对方户名/对方账号/发生额(分)
         advance_record = None
         for candidate in zero_records:
             if candidate['amount'] >= 0:
@@ -2537,52 +2451,42 @@ def detect_settlement_refund_full_matching(
                 continue
             if candidate['counterparty_name'] != _normalize_confirm_text_value(rec_2301['收款人名称']):
                 continue
-            if candidate['date'] > qing_for_2301['date']:
+            if candidate['counterparty_account'] != _normalize_confirm_account_value(rec_2301['收款人账号']):
                 continue
-            if advance_record is None or candidate['time'] > advance_record['time']:
+            if candidate['date'] >= gold_date:
+                continue
+            if advance_record is None or candidate['date'] > advance_record['date']:
                 advance_record = candidate
         if advance_record is None:
             continue
-
-        clearing_date = rec_2301['日期对象']
-        zero_date = zero_refund['date']
-        tui_zhuan_date = tui_zhuan['date']
-        gold_date = qing_gold['date']
         advance_date = advance_record['date']
 
         interval1 = working_days_between(
-            max(clearing_date, zero_date, tui_zhuan_date).date(),
+            max(clearing_date, zero_refund['date']).date(),
             gold_date.date(),
         )
-        interval2 = working_days_between(zero_date.date(), tui_zhuan_date.date())
-        if interval1 <= 1 and interval2 <= 1:
+        if interval1 <= 1:
             continue
 
         results.append({
             '零余额单位流水文件名称': zero_refund['file_name'],
-            '垫款户流水文件名称': qing_gold['file_name'],
             '清算日期': clearing_date.strftime('%Y-%m-%d'),
-            '退至零余额日期': zero_date.strftime('%Y-%m-%d'),
-            '退至垫款户日期': tui_zhuan_date.strftime('%Y-%m-%d'),
-            '退至金库日期': gold_date.strftime('%Y-%m-%d'),
+            '退至零余额账户日期': zero_refund['date'].strftime('%Y-%m-%d'),
+            '退至国库日期': gold_date.strftime('%Y-%m-%d'),
             '垫款日期': advance_date.strftime('%Y-%m-%d'),
             '金额': zero_refund['amount'],
             '零余额账户收款人名称': zero_refund['counterparty_name'],
-            '垫款户收款人名称': qing_receive['counterparty_name'],
             '清算交易对方收款人名称': rec_2301['收款人名称'],
         })
 
     columns = [
         '零余额单位流水文件名称',
-        '垫款户流水文件名称',
         '清算日期',
-        '退至零余额日期',
-        '退至垫款户日期',
-        '退至金库日期',
+        '退至零余额账户日期',
+        '退至国库日期',
         '垫款日期',
         '金额',
         '零余额账户收款人名称',
-        '垫款户收款人名称',
         '清算交易对方收款人名称',
     ]
     result_df = pd.DataFrame(results, columns=columns)
