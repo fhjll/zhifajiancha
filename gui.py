@@ -125,6 +125,7 @@ class App(ctk.CTk):
         self.settlement_check_account = ctk.StringVar(value="待报解预算收入")
         self.settlement_check_days = ctk.StringVar(value="2")
         self.settlement_confirm_file = ctk.StringVar(value="")
+        self.auto_detect_accounts = ctk.BooleanVar(value=True)
 
         # ── 流水预处理 ──
         self.preprocess_input_path = ctk.StringVar(value="")
@@ -391,23 +392,20 @@ class App(ctk.CTk):
         row_f = ctk.CTkFrame(tab, fg_color="transparent")
         row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
         row_f.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(row_f, text="明细CSV", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkLabel(row_f, text="明细CSV文件夹", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
         ctk.CTkEntry(row_f, textvariable=self.settlement_confirm_file,
-                     placeholder_text="选择包含2301/2302明细的确认CSV...").grid(
+                     placeholder_text="选择包含多份明细CSV的文件夹...").grid(
             row=0, column=1, sticky="ew", padx=(0, 8))
-        ctk.CTkButton(row_f, text="浏览", width=64,
-                       command=lambda: self._browse_file(self.settlement_confirm_file)
+        ctk.CTkButton(row_f, text="目录", width=64,
+                       command=lambda: self._browse_directory(self.settlement_confirm_file)
                        ).grid(row=0, column=2, padx=(0, 6))
         r += 1
 
-        # 指定账户
         row_f = ctk.CTkFrame(tab, fg_color="transparent")
         row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
-        row_f.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(row_f, text="指定账户", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
-        ctk.CTkEntry(row_f, textvariable=self.settlement_check_account,
-                     placeholder_text="多账户用逗号分隔，如: 待报解预算收入,国库经收处").grid(
-            row=0, column=1, columnspan=2, sticky="ew", padx=(0, 6))
+        ctk.CTkLabel(row_f, text="", width=LW).grid(row=0, column=0, padx=(6, 8))
+        ctk.CTkCheckBox(row_f, text="自动检测垫款户",
+                         variable=self.auto_detect_accounts).grid(row=0, column=1, sticky="w")
         r += 1
 
         # 运行按钮
@@ -1460,18 +1458,17 @@ class App(ctk.CTk):
         self._log_step("═══ 清算退款检查：全链路匹配 ═══")
         self._log_result(f"  零余额账户文件夹: {zero_folder}")
         self._log_result(f"  垫款户文件夹: {qing_folder}")
-        self._log_result(f"  明细CSV: {confirm_path}")
-        account_name = self.settlement_check_account.get().strip() or "待报解预算收入"
+        self._log_result(f"  明细CSV文件夹: {confirm_path}")
         advance_name = self.advance_acct_name.get().strip() or "集中支付零余额清算待转"
-        self._log_result(f"  指定账户: {account_name}")
         self._log_result(f"  垫款户名称: {advance_name}")
 
         results = detect_settlement_refund_full_matching(
             zero_folder=zero_folder,
             qing_folder=qing_folder,
             confirm_file=confirm_path,
-            designated_account=account_name,
+            designated_account='',
             advance_acct_name=advance_name,
+            auto_detect=self.auto_detect_accounts.get(),
             output_path=output_path,
         )
         self._log_result(f"  异常记录数: {len(results)}")
