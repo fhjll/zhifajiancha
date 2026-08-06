@@ -2386,6 +2386,9 @@ def detect_settlement_refund_full_matching(
     zero_folder,
     confirm_file,
     output_path=None,
+    unmatched_2302_output_path=None,
+    unmatched_2301_output_path=None,
+    unmatched_clearing_output_path=None,
 ):
     """
     零余额账户 + 明细CSV 清算退款检查。
@@ -2396,6 +2399,9 @@ def detect_settlement_refund_full_matching(
     zero_records = _load_flow_folder_records(zero_folder, 'zero')
 
     results = []
+    matched_2302_indices = set()
+    unmatched_2301_2302_indices = set()
+    unmatched_clearing_2301_indices = set()
     for zero in zero_records:
         if zero['amount'] <= 0:
             continue
@@ -2406,7 +2412,8 @@ def detect_settlement_refund_full_matching(
 
         # 2302 明细：根据对方账号和金额匹配，退至国库日期取 2302 日期
         rec_2302 = None
-        for _, row in confirm_2302.iterrows():
+        rec_2302_idx = None
+        for idx, row in confirm_2302.iterrows():
             if not _amount_matches_refund(row['发生额'], zero_refund['amount']):
                 continue
             if _normalize_confirm_account_value(row['收款人账号']) != zero_refund['counterparty_account']:
@@ -2415,13 +2422,16 @@ def detect_settlement_refund_full_matching(
                 continue
             if rec_2302 is None or row['日期对象'].date() < rec_2302['日期对象'].date():
                 rec_2302 = row
+                rec_2302_idx = idx
         if rec_2302 is None:
             continue
+        matched_2302_indices.add(rec_2302_idx)
         gold_date = rec_2302['日期对象']
 
         # 2301 明细：在退至国库日期之前匹配，清算日期取 2301 日期
         rec_2301 = None
-        for _, row in confirm_2301.iterrows():
+        rec_2301_idx = None
+        for idx, row in confirm_2301.iterrows():
             if _normalize_confirm_text_value(row['付款人名称']) != _normalize_confirm_text_value(rec_2302['付款人名称']):
                 continue
             if _normalize_confirm_account_value(row['付款人账号']) != _normalize_confirm_account_value(rec_2302['付款人账号']):
@@ -2440,7 +2450,9 @@ def detect_settlement_refund_full_matching(
                 continue
             if rec_2301 is None or row['日期对象'].date() > rec_2301['日期对象'].date():
                 rec_2301 = row
+                rec_2301_idx = idx
         if rec_2301 is None:
+            unmatched_2301_2302_indices.add(rec_2302_idx)
             continue
         clearing_date = rec_2301['日期对象']
 
@@ -2460,6 +2472,7 @@ def detect_settlement_refund_full_matching(
             if advance_record is None or candidate['date'] > advance_record['date']:
                 advance_record = candidate
         if advance_record is None:
+            unmatched_clearing_2301_indices.add(rec_2301_idx)
             continue
         advance_date = advance_record['date']
 
@@ -2495,6 +2508,30 @@ def detect_settlement_refund_full_matching(
     if output_path is not None:
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
         result_df.to_excel(output_path, index=False)
+
+    if unmatched_2302_output_path is None and output_path is not None:
+        unmatched_2302_output_path = os.path.join(
+            os.path.dirname(output_path) or '.', '未匹配2302明细.xlsx'
+        )
+    if unmatched_2302_output_path is not None:
+        unmatched_2302 = confirm_2302.loc[
+            ~confirm_2302.index.isin(matched_2302_indices)
+        ].copy()
+        save_columns = [c for c in unmatched_2302.columns if c != '日期对象']
+        unmatched_2302[save_columns].to_excel(unmatched_2302_output_path, index=False)
+        print(f"[清算退款检查] 未匹配2302明细数: {len(unmatched_2302)}")
+
+    if unmatched_2301_output_path is not None and unmatched_2301_2302_indices:
+        unmatched_2301 = confirm_2302.loc[list(unmatched_2301_2302_indices)].copy()
+        save_columns = [c for c in unmatched_2301.columns if c != '日期对象']
+        unmatched_2301[save_columns].to_excel(unmatched_2301_output_path, index=False)
+        print(f"[清算退款检查] 未匹配2301对应2302数: {len(unmatched_2301)}")
+
+    if unmatched_clearing_output_path is not None and unmatched_clearing_2301_indices:
+        unmatched_clearing = confirm_2301.loc[list(unmatched_clearing_2301_indices)].copy()
+        save_columns = [c for c in unmatched_clearing.columns if c != '日期对象']
+        unmatched_clearing[save_columns].to_excel(unmatched_clearing_output_path, index=False)
+        print(f"[清算退款检查] 未匹配清算记录对应2301数: {len(unmatched_clearing)}")
     return result_df
 
 
