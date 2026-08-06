@@ -375,19 +375,6 @@ class App(ctk.CTk):
                        ).grid(row=0, column=2, padx=(0, 6))
         r += 1
 
-        # 垫款户流水文件夹
-        row_f = ctk.CTkFrame(tab, fg_color="transparent")
-        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
-        row_f.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(row_f, text="垫款户", width=LW, anchor="w").grid(row=0, column=0, padx=(6, 8))
-        ctk.CTkEntry(row_f, textvariable=self.settlement_qing_folder,
-                     placeholder_text="选择垫款户流水文件夹...").grid(
-            row=0, column=1, sticky="ew", padx=(0, 8))
-        ctk.CTkButton(row_f, text="目录", width=64,
-                       command=lambda: self._browse_directory(self.settlement_qing_folder)
-                       ).grid(row=0, column=2, padx=(0, 6))
-        r += 1
-
         # 明细 CSV
         row_f = ctk.CTkFrame(tab, fg_color="transparent")
         row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
@@ -399,13 +386,6 @@ class App(ctk.CTk):
         ctk.CTkButton(row_f, text="目录", width=64,
                        command=lambda: self._browse_directory(self.settlement_confirm_file)
                        ).grid(row=0, column=2, padx=(0, 6))
-        r += 1
-
-        row_f = ctk.CTkFrame(tab, fg_color="transparent")
-        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=2, padx=(6, 6))
-        ctk.CTkLabel(row_f, text="", width=LW).grid(row=0, column=0, padx=(6, 8))
-        ctk.CTkCheckBox(row_f, text="自动检测垫款户",
-                         variable=self.auto_detect_accounts).grid(row=0, column=1, sticky="w")
         r += 1
 
         # 运行按钮
@@ -1417,13 +1397,9 @@ class App(ctk.CTk):
             return
 
         zero_folder = self.settlement_zero_folder.get().strip()
-        qing_folder = self.settlement_qing_folder.get().strip()
         confirm_path = self.settlement_confirm_file.get().strip()
         if not zero_folder or not os.path.exists(zero_folder):
             self._log_error(f"零余额账户文件夹不存在: {zero_folder}")
-            return
-        if not qing_folder or not os.path.exists(qing_folder):
-            self._log_error(f"垫款户文件夹不存在: {qing_folder}")
             return
         if not confirm_path or not os.path.exists(confirm_path):
             self._log_error(f"明细CSV不存在: {confirm_path}")
@@ -1449,7 +1425,6 @@ class App(ctk.CTk):
 
     def _run_settlement_check_internal(self):
         zero_folder = self.settlement_zero_folder.get().strip()
-        qing_folder = self.settlement_qing_folder.get().strip()
         confirm_path = self.settlement_confirm_file.get().strip()
         out_dir = self.output_dir.get()
         os.makedirs(out_dir, exist_ok=True)
@@ -1457,18 +1432,11 @@ class App(ctk.CTk):
 
         self._log_step("═══ 清算退款检查：全链路匹配 ═══")
         self._log_result(f"  零余额账户文件夹: {zero_folder}")
-        self._log_result(f"  垫款户文件夹: {qing_folder}")
         self._log_result(f"  明细CSV文件夹: {confirm_path}")
-        advance_name = self.advance_acct_name.get().strip() or "集中支付零余额清算待转"
-        self._log_result(f"  垫款户名称: {advance_name}")
 
         results = detect_settlement_refund_full_matching(
             zero_folder=zero_folder,
-            qing_folder=qing_folder,
             confirm_file=confirm_path,
-            designated_account='',
-            advance_acct_name=advance_name,
-            auto_detect=self.auto_detect_accounts.get(),
             output_path=output_path,
         )
         self._log_result(f"  异常记录数: {len(results)}")
