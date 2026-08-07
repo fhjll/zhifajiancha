@@ -2410,6 +2410,19 @@ def detect_settlement_refund_full_matching(
         zero_refund = zero
         zero_day = zero_refund['date'].date() if isinstance(zero_refund['date'], datetime) else zero_refund['date']
 
+        def _append_result(status, clearing_date=None, gold_date=None, advance_date=None, receiver_name=''):
+            results.append({
+                '零余额单位流水文件名称': zero_refund['file_name'],
+                '清算日期': clearing_date.strftime('%Y-%m-%d') if clearing_date is not None else '',
+                '退至零余额账户日期': zero_refund['date'].strftime('%Y-%m-%d'),
+                '退至国库日期': gold_date.strftime('%Y-%m-%d') if gold_date is not None else '',
+                '垫款日期': advance_date.strftime('%Y-%m-%d') if advance_date is not None else '',
+                '金额': zero_refund['amount'],
+                '零余额账户收款人名称': zero_refund['counterparty_name'],
+                '清算交易对方收款人名称': receiver_name,
+                '正常/违规': status,
+            })
+
         # 2302 明细：根据对方账号和金额匹配，退至国库日期取 2302 日期
         rec_2302 = None
         rec_2302_idx = None
@@ -2424,6 +2437,7 @@ def detect_settlement_refund_full_matching(
                 rec_2302 = row
                 rec_2302_idx = idx
         if rec_2302 is None:
+            _append_result('违规')
             continue
         matched_2302_indices.add(rec_2302_idx)
         gold_date = rec_2302['日期对象']
@@ -2453,6 +2467,7 @@ def detect_settlement_refund_full_matching(
                 rec_2301_idx = idx
         if rec_2301 is None:
             unmatched_2301_2302_indices.add(rec_2302_idx)
+            _append_result('违规')
             continue
         clearing_date = rec_2301['日期对象']
 
@@ -2473,6 +2488,7 @@ def detect_settlement_refund_full_matching(
                 advance_record = candidate
         if advance_record is None:
             unmatched_clearing_2301_indices.add(rec_2301_idx)
+            _append_result('违规')
             continue
         advance_date = advance_record['date']
 
@@ -2480,19 +2496,13 @@ def detect_settlement_refund_full_matching(
             max(clearing_date, zero_refund['date']).date(),
             gold_date.date(),
         )
-        if interval1 <= 1:
-            continue
-
-        results.append({
-            '零余额单位流水文件名称': zero_refund['file_name'],
-            '清算日期': clearing_date.strftime('%Y-%m-%d'),
-            '退至零余额账户日期': zero_refund['date'].strftime('%Y-%m-%d'),
-            '退至国库日期': gold_date.strftime('%Y-%m-%d'),
-            '垫款日期': advance_date.strftime('%Y-%m-%d'),
-            '金额': zero_refund['amount'],
-            '零余额账户收款人名称': zero_refund['counterparty_name'],
-            '清算交易对方收款人名称': rec_2301['收款人名称'],
-        })
+        _append_result(
+            '正常' if interval1 <= 1 else '违规',
+            clearing_date=clearing_date,
+            gold_date=gold_date,
+            advance_date=advance_date,
+            receiver_name=rec_2301['收款人名称'],
+        )
 
     columns = [
         '零余额单位流水文件名称',
@@ -2503,6 +2513,7 @@ def detect_settlement_refund_full_matching(
         '金额',
         '零余额账户收款人名称',
         '清算交易对方收款人名称',
+        '正常/违规',
     ]
     result_df = pd.DataFrame(results, columns=columns)
     if output_path is not None:
