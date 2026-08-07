@@ -684,6 +684,7 @@ def _load_zero_balance(xls, sheet_name):
     # 自动检测表头行
     header_row = _detect_header_row(xls, sheet_name)
     df = pd.read_excel(xls, sheet_name=sheet_name, header=header_row)
+    df = _normalize_csv_columns(df, convert_fen=False)
 
     # 标准格式：含 交易日期 列
     if '交易日期' in df.columns:
@@ -1965,8 +1966,15 @@ def _parse_zero_balance_time(df):
 
 def _load_zero_balance_flow_file(filepath):
     """读取一个零余额账户流水文件，合并 Excel 多 Sheet，统一日期/时间/金额/账号字段。"""
-    if _is_csv_file(filepath):
-        _, df = _load_dataframe(filepath)
+    def _load_as_csv():
+        df_raw = _read_csv_raw(filepath)
+        header_row = _detect_header_row_from_df(df_raw)
+        df = df_raw.iloc[header_row:].reset_index(drop=True)
+        df.columns = [
+            str(c).strip() if pd.notna(c) else f'col_{i}'
+            for i, c in enumerate(df.iloc[0])
+        ]
+        df = df.iloc[1:].reset_index(drop=True)
         if len(df) == 0:
             return pd.DataFrame()
         df = _normalize_csv_columns(df, convert_fen=False)
@@ -1989,17 +1997,24 @@ def _load_zero_balance_flow_file(filepath):
             df['对方账号'] = df['对方帐号']
         if '对方账号' not in df.columns:
             df['对方账号'] = ''
+        return df
+
+    if _is_csv_file(filepath):
+        df = _load_as_csv()
     else:
-        xls = pd.ExcelFile(filepath)
-        frames = []
-        for sheet_name in xls.sheet_names:
-            sheet_df = _load_zero_balance(xls, sheet_name)
-            if len(sheet_df) > 0:
-                sheet_df['_sheet名称'] = sheet_name
-                frames.append(sheet_df)
-        if not frames:
-            return pd.DataFrame()
-        df = pd.concat(frames, ignore_index=True)
+        try:
+            xls = pd.ExcelFile(filepath)
+            frames = []
+            for sheet_name in xls.sheet_names:
+                sheet_df = _load_zero_balance(xls, sheet_name)
+                if len(sheet_df) > 0:
+                    sheet_df['_sheet名称'] = sheet_name
+                    frames.append(sheet_df)
+            if not frames:
+                return pd.DataFrame()
+            df = pd.concat(frames, ignore_index=True)
+        except Exception:
+            df = _load_as_csv()
         if '对方账号' not in df.columns and '对方帐号' in df.columns:
             df['对方账号'] = df['对方帐号']
         if '对方账号' not in df.columns:
@@ -2294,6 +2309,7 @@ def _load_flow_folder_records(folder, kind='zero'):
         os.path.join(folder, name)
         for name in os.listdir(folder)
         if os.path.splitext(name)[1].lower() in exts
+        and not name.startswith(('.', '~$', '.~'))
     )
     records = []
     for filepath in files:
@@ -2342,6 +2358,17 @@ def _amount_matches_refund(confirm_amount, refund_amount):
     if confirm_amount is None or refund_amount is None:
         return False
     return round(abs(confirm_amount * 100)) == round(abs(refund_amount))
+
+
+def _account_numbers_match(account_a, account_b):
+    """账号比较，兼容明细账号比流水账号多尾部0的情况。"""
+    account_a = _normalize_confirm_account_value(account_a)
+    account_b = _normalize_confirm_account_value(account_b)
+    if not account_a or not account_b:
+        return account_a == account_b
+    if account_a == account_b:
+        return True
+    return account_a.rstrip('0') == account_b.rstrip('0')
 
 
 _DESIGNATED_NAME_KEYWORDS = ('财政局', '保工资', '超长期国债', '非税收入')
@@ -2433,7 +2460,7 @@ def detect_settlement_refund_full_matching(
         for idx, row in confirm_2302.iterrows():
             if not _amount_matches_refund(row['发生额'], zero_refund['amount']):
                 continue
-            if _normalize_confirm_account_value(row['收款人账号']) != zero_refund['counterparty_account']:
+            if not _account_numbers_match(row['收款人账号'], zero_refund['counterparty_account']):
                 continue
             if row['日期对象'].date() < zero_day:
                 continue
@@ -2453,11 +2480,11 @@ def detect_settlement_refund_full_matching(
         for idx, row in confirm_2301.iterrows():
             if _normalize_confirm_text_value(row['付款人名称']) != _normalize_confirm_text_value(rec_2302['付款人名称']):
                 continue
-            if _normalize_confirm_account_value(row['付款人账号']) != _normalize_confirm_account_value(rec_2302['付款人账号']):
+            if not _account_numbers_match(row['付款人账号'], rec_2302['付款人账号']):
                 continue
             if _normalize_confirm_text_value(row['收款人名称']) != _normalize_confirm_text_value(rec_2302['收款人名称']):
                 continue
-            if _normalize_confirm_account_value(row['收款人账号']) != _normalize_confirm_account_value(rec_2302['收款人账号']):
+            if not _account_numbers_match(row['收款人账号'], rec_2302['收款人账号']):
                 continue
             if row['摘要'] != rec_2302['摘要']:
                 continue
@@ -2472,7 +2499,7 @@ def detect_settlement_refund_full_matching(
                 rec_2301_idx = idx
         if rec_2301 is None:
             unmatched_2301_2302_indices.add(rec_2302_idx)
-            _append_result('违规')
+            _append_result('违规', gold_date=gold_date)
             continue
         matched_2301_count += 1
         clearing_date = rec_2301['日期对象']
@@ -2486,7 +2513,7 @@ def detect_settlement_refund_full_matching(
                 continue
             if candidate['counterparty_name'] != _normalize_confirm_text_value(rec_2301['收款人名称']):
                 continue
-            if candidate['counterparty_account'] != _normalize_confirm_account_value(rec_2301['收款人账号']):
+            if not _account_numbers_match(candidate['counterparty_account'], rec_2301['收款人账号']):
                 continue
             if candidate['date'] >= gold_date:
                 continue
@@ -2494,7 +2521,12 @@ def detect_settlement_refund_full_matching(
                 advance_record = candidate
         if advance_record is None:
             unmatched_clearing_2301_indices.add(rec_2301_idx)
-            _append_result('违规')
+            _append_result(
+                '违规',
+                clearing_date=clearing_date,
+                gold_date=gold_date,
+                receiver_name=rec_2301['收款人名称'],
+            )
             continue
         advance_date = advance_record['date']
 
@@ -2557,10 +2589,7 @@ def detect_settlement_refund_full_matching(
 
 
 def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
-    """加载二次确认 CSV，按凭证类型编号筛选记录。"""
-    if not _is_csv_file(filepath):
-        raise ValueError(f"二次确认数据需为 CSV 文件: {filepath}")
-
+    """加载确认明细文件（Excel/CSV），按凭证类型编号筛选记录。"""
     _, df = _load_dataframe(filepath)
     if len(df) == 0:
         return pd.DataFrame()
@@ -2620,7 +2649,7 @@ def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
     if '发生额' not in df.columns and '支付金额' in df.columns:
         df['发生额'] = df['支付金额']
 
-    required_cols = ['交易日期', '付款人名称', '付款人账号', '收款人名称', '收款人账号', '凭证类型编号', '发生额']
+    required_cols = ['交易日期', '收款人名称', '收款人账号', '凭证类型编号', '发生额']
     missing_cols = [c for c in required_cols if c not in df.columns]
     if missing_cols:
         raise ValueError(
@@ -2630,6 +2659,10 @@ def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
 
     df['日期对象'] = df['交易日期'].apply(_parse_confirm_date)
     df = df.dropna(subset=['日期对象'])
+    if '付款人名称' not in df.columns:
+        df['付款人名称'] = ''
+    if '付款人账号' not in df.columns:
+        df['付款人账号'] = ''
     df['付款人名称'] = df['付款人名称'].map(_normalize_confirm_text_value)
     df['付款人账号'] = df['付款人账号'].map(_normalize_confirm_account_value)
     df['收款人名称'] = df['收款人名称'].map(_normalize_confirm_text_value)
@@ -2660,7 +2693,8 @@ def _load_settlement_confirm_records(path, voucher_code='2302'):
         files = sorted(
             os.path.join(path, name)
             for name in os.listdir(path)
-            if os.path.splitext(name)[1].lower() in ('.csv', '.txt')
+            if os.path.splitext(name)[1].lower() in ('.csv', '.txt', '.xlsx', '.xls')
+            and not name.startswith(('.', '~$', '.~'))
         )
         frames = [
             _load_settlement_confirm_csv(f, voucher_code=voucher_code)
