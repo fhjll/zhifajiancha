@@ -2424,6 +2424,7 @@ def detect_settlement_refund_full_matching(
     confirm_2302 = _load_settlement_confirm_records(confirm_file, voucher_code='2302')
     confirm_2301 = _load_settlement_confirm_records(confirm_file, voucher_code='2301')
     zero_records = _load_flow_folder_records(zero_folder, 'zero')
+    advance_names = _auto_detect_advance_accounts(zero_records, [])
 
     results = []
     matched_2302_indices = set()
@@ -2441,17 +2442,28 @@ def detect_settlement_refund_full_matching(
         zero_refund = zero
         zero_day = zero_refund['date'].date() if isinstance(zero_refund['date'], datetime) else zero_refund['date']
 
-        def _append_result(status, clearing_date=None, gold_date=None, advance_date=None, receiver_name=''):
+        tui_zhuan = None
+        for candidate in zero_records:
+            if candidate['file_name'] != zero_refund['file_name']:
+                continue
+            if candidate['amount'] >= 0:
+                continue
+            if abs(candidate['amount']) != abs(zero_refund['amount']):
+                continue
+            if not _is_advance_counterparty(candidate['counterparty_name'], advance_names):
+                continue
+            if candidate['time'] <= zero_refund['time']:
+                continue
+            if tui_zhuan is None or candidate['time'] < tui_zhuan['time']:
+                tui_zhuan = candidate
+        tui_zhuan_date = tui_zhuan['date'] if tui_zhuan is not None else None
+
+        def _append_result(clearing_date=None, gold_date=None):
             results.append({
                 '零余额单位流水文件名称': zero_refund['file_name'],
                 '清算日期': clearing_date.strftime('%Y-%m-%d') if clearing_date is not None else '',
-                '退至零余额账户日期': zero_refund['date'].strftime('%Y-%m-%d'),
-                '退至国库日期': gold_date.strftime('%Y-%m-%d') if gold_date is not None else '',
-                '垫款日期': advance_date.strftime('%Y-%m-%d') if advance_date is not None else '',
-                '金额': zero_refund['amount'],
-                '零余额账户收款人名称': zero_refund['counterparty_name'],
-                '清算交易对方收款人名称': receiver_name,
-                '正常/违规': status,
+                '退回零余额日期': zero_refund['date'].strftime('%Y-%m-%d'),
+                '退回金库日期': gold_date.strftime('%Y-%m-%d') if gold_date is not None else '',
             })
 
         # 2302 明细：根据对方账号和金额匹配，退至国库日期取 2302 日期
@@ -2468,7 +2480,7 @@ def detect_settlement_refund_full_matching(
                 rec_2302 = row
                 rec_2302_idx = idx
         if rec_2302 is None:
-            _append_result('违规')
+            _append_result()
             continue
         matched_2302_count += 1
         matched_2302_indices.add(rec_2302_idx)
@@ -2495,69 +2507,27 @@ def detect_settlement_refund_full_matching(
                 rec_2301_idx = idx
         if rec_2301 is None:
             unmatched_2301_2302_indices.add(rec_2302_idx)
-            _append_result('违规', gold_date=gold_date)
+            _append_result(gold_date=gold_date)
             continue
         matched_2301_count += 1
         clearing_date = rec_2301['日期对象']
 
-        # 垫款记录：2301 收款人/收款账号/支付金额(元) 匹配零余额账户对方户名/对方账号/发生额(分)
-        advance_record = None
-        for candidate in zero_records:
-            if candidate['amount'] >= 0:
-                continue
-            if round(abs(candidate['amount'])) != round(abs(_normalize_confirm_amount_value(rec_2301['发生额']) or 0) * 100):
-                continue
-            if candidate['counterparty_name'] != _normalize_confirm_text_value(rec_2301['收款人名称']):
-                continue
-            if not _account_numbers_match(candidate['counterparty_account'], rec_2301['收款人账号']):
-                continue
-            if candidate['date'] >= gold_date:
-                continue
-            if advance_record is None or candidate['date'] > advance_record['date']:
-                advance_record = candidate
-        if advance_record is None:
-            unmatched_clearing_2301_indices.add(rec_2301_idx)
-            _append_result(
-                '违规',
-                clearing_date=clearing_date,
-                gold_date=gold_date,
-                receiver_name=rec_2301['收款人名称'],
-            )
-            continue
-        advance_date = advance_record['date']
-
-        interval1 = working_days_between(
-            max(clearing_date, zero_refund['date']).date(),
-            gold_date.date(),
-        )
         _append_result(
-            '正常' if interval1 <= 1 else '违规',
             clearing_date=clearing_date,
             gold_date=gold_date,
-            advance_date=advance_date,
-            receiver_name=rec_2301['收款人名称'],
         )
 
     columns = [
         '零余额单位流水文件名称',
         '清算日期',
-        '退至零余额账户日期',
-        '退至国库日期',
-        '垫款日期',
-        '金额',
-        '零余额账户收款人名称',
-        '清算交易对方收款人名称',
-        '正常/违规',
+        '退回零余额日期',
+        '退回金库日期',
     ]
     result_df = pd.DataFrame(results, columns=columns)
     if output_path is not None:
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
         result_df.to_excel(output_path, index=False)
 
-    if unmatched_2302_output_path is None and output_path is not None:
-        unmatched_2302_output_path = os.path.join(
-            os.path.dirname(output_path) or '.', '未匹配2302明细.xlsx'
-        )
     if unmatched_2302_output_path is not None:
         unmatched_2302 = confirm_2302.loc[
             ~confirm_2302.index.isin(matched_2302_indices)
