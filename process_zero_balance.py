@@ -2402,11 +2402,15 @@ def detect_settlement_refund_full_matching(
     matched_2302_indices = set()
     unmatched_2301_2302_indices = set()
     unmatched_clearing_2301_indices = set()
+    refund_count = 0
+    matched_2302_count = 0
+    matched_2301_count = 0
     for zero in zero_records:
         if zero['amount'] <= 0:
             continue
         if '财政零余额' in zero['counterparty_name'] or '垫款' in zero['counterparty_name']:
             continue
+        refund_count += 1
         zero_refund = zero
         zero_day = zero_refund['date'].date() if isinstance(zero_refund['date'], datetime) else zero_refund['date']
 
@@ -2439,6 +2443,7 @@ def detect_settlement_refund_full_matching(
         if rec_2302 is None:
             _append_result('违规')
             continue
+        matched_2302_count += 1
         matched_2302_indices.add(rec_2302_idx)
         gold_date = rec_2302['日期对象']
 
@@ -2469,6 +2474,7 @@ def detect_settlement_refund_full_matching(
             unmatched_2301_2302_indices.add(rec_2302_idx)
             _append_result('违规')
             continue
+        matched_2301_count += 1
         clearing_date = rec_2301['日期对象']
 
         # 垫款记录：2301 收款人/收款账号/支付金额(元) 匹配零余额账户对方户名/对方账号/发生额(分)
@@ -2543,6 +2549,10 @@ def detect_settlement_refund_full_matching(
         save_columns = [c for c in unmatched_clearing.columns if c != '日期对象']
         unmatched_clearing[save_columns].to_excel(unmatched_clearing_output_path, index=False)
         print(f"[清算退款检查] 未匹配清算记录对应2301数: {len(unmatched_clearing)}")
+    print(
+        f"[清算退款检查] 退款记录:{refund_count} "
+        f"匹配2302:{matched_2302_count} 匹配2301:{matched_2301_count}"
+    )
     return result_df
 
 
