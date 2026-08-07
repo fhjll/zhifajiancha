@@ -2464,6 +2464,9 @@ def detect_settlement_refund_full_matching(
                 '清算日期': clearing_date.strftime('%Y-%m-%d') if clearing_date is not None else '',
                 '退回零余额日期': zero_refund['date'].strftime('%Y-%m-%d'),
                 '退回金库日期': gold_date.strftime('%Y-%m-%d') if gold_date is not None else '',
+                '金额': zero_refund['amount'],
+                '对方账号': zero_refund['counterparty_account'],
+                '对方户名': zero_refund['counterparty_name'],
             })
 
         # 2302 明细：根据对方账号和金额匹配，退至国库日期取 2302 日期
@@ -2522,6 +2525,9 @@ def detect_settlement_refund_full_matching(
         '清算日期',
         '退回零余额日期',
         '退回金库日期',
+        '金额',
+        '对方账号',
+        '对方户名',
     ]
     result_df = pd.DataFrame(results, columns=columns)
     if output_path is not None:
