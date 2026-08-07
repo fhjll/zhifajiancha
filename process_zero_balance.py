@@ -2478,10 +2478,6 @@ def detect_settlement_refund_full_matching(
         rec_2301 = None
         rec_2301_idx = None
         for idx, row in confirm_2301.iterrows():
-            if _normalize_confirm_text_value(row['付款人名称']) != _normalize_confirm_text_value(rec_2302['付款人名称']):
-                continue
-            if not _account_numbers_match(row['付款人账号'], rec_2302['付款人账号']):
-                continue
             if _normalize_confirm_text_value(row['收款人名称']) != _normalize_confirm_text_value(rec_2302['收款人名称']):
                 continue
             if not _account_numbers_match(row['收款人账号'], rec_2302['收款人账号']):
@@ -2612,6 +2608,7 @@ def _load_settlement_confirm_csv(filepath, voucher_code='2302'):
         '汇总金额': '汇总清算金额',
         '凭证类型': '凭证类型编号',
         '凭证类型编号': '凭证类型编号',
+        '凭证编号': '凭证类型编号',
         '票据类型': '凭证类型编号',
         '支付金额': '支付金额',
         '付款金额': '支付金额',
