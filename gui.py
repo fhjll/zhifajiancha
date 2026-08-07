@@ -144,6 +144,11 @@ class App(ctk.CTk):
         self.delayed_settlement_input = ctk.StringVar(value="")
         self.delayed_settlement_output = ctk.StringVar(value="")
 
+        # ── 工具箱 ──
+        self.toolbox_folder = ctk.StringVar(value="")
+        self.toolbox_output = ctk.StringVar(value="")
+        self.toolbox_recursive = ctk.BooleanVar(value=True)
+
         # 文书生成
         self.results_path = ctk.StringVar(value="")
         self.template_path = ctk.StringVar(value="")
@@ -163,6 +168,7 @@ class App(ctk.CTk):
         self.running_sc = False
         self.running_finance = False
         self.running_interval = False
+        self._toolbox_running = False
 
         # 并行控制
         self.max_workers = ctk.StringVar(value="1")
@@ -186,15 +192,25 @@ class App(ctk.CTk):
         title_frame.grid(row=0, column=0, sticky="ew", padx=24, pady=(16, 6))
         title_frame.grid_columnconfigure(1, weight=1)
 
-        # LLM 配置按钮 + 版本号（左上角）
+        # 工具箱 + 大模型配置按钮 + 版本号（左上角）
+        left_actions = ctk.CTkFrame(title_frame, fg_color="transparent")
+        left_actions.grid(row=0, column=0, sticky="w")
+        self.toolbox_btn = ctk.CTkButton(
+            left_actions, text="🧰  工具箱",
+            font=ctk.CTkFont(size=12),
+            width=100, height=28,
+            corner_radius=6,
+            command=self._open_toolbox,
+        )
+        self.toolbox_btn.pack(side="left", padx=(0, 8))
         self.llm_config_btn = ctk.CTkButton(
-            title_frame, text="⚙  大模型配置",
+            left_actions, text="⚙  大模型配置",
             font=ctk.CTkFont(size=12),
             width=110, height=28,
             corner_radius=6,
             command=self._open_llm_config,
         )
-        self.llm_config_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.llm_config_btn.pack(side="left")
 
         ctk.CTkLabel(
             title_frame, text="v1.0",
@@ -1052,6 +1068,175 @@ class App(ctk.CTk):
         path = filedialog.askdirectory(title="选择流水文件文件夹")
         if path:
             var.set(path)
+
+    # ──────────── 工具箱：文件名称汇总 ────────────
+
+    def _open_toolbox(self):
+        """弹出工具箱窗口"""
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("工具箱")
+        dlg.geometry("620x360")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        dlg.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
+
+        main = ctk.CTkFrame(dlg, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=20, pady=(16, 12))
+        main.grid_columnconfigure(1, weight=1)
+
+        r = 0
+        ctk.CTkLabel(
+            main, text="文件名称汇总",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).grid(row=r, column=0, columnspan=3, sticky="w", pady=(0, 12))
+        r += 1
+
+        # 指定文件夹
+        row_f = ctk.CTkFrame(main, fg_color="transparent")
+        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=4)
+        row_f.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(row_f, text="指定文件夹", width=90, anchor="w").grid(
+            row=0, column=0, padx=(0, 8))
+        ctk.CTkEntry(row_f, textvariable=self.toolbox_folder,
+                     placeholder_text="选择需要汇总文件名称的文件夹...").grid(
+            row=0, column=1, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(row_f, text="目录", width=64,
+                       command=self._browse_toolbox_folder).grid(row=0, column=2)
+        r += 1
+
+        # 输出文件
+        row_f = ctk.CTkFrame(main, fg_color="transparent")
+        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=4)
+        row_f.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(row_f, text="输出文件", width=90, anchor="w").grid(
+            row=0, column=0, padx=(0, 8))
+        ctk.CTkEntry(row_f, textvariable=self.toolbox_output,
+                     placeholder_text="留空自动生成到所选文件夹").grid(
+            row=0, column=1, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(row_f, text="另存为", width=64,
+                       command=lambda: self._browse_save_as(
+                           self.toolbox_output, "Excel 文件", ".xlsx")
+                       ).grid(row=0, column=2)
+        r += 1
+
+        # 选项
+        row_f = ctk.CTkFrame(main, fg_color="transparent")
+        row_f.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(8, 4))
+        ctk.CTkCheckBox(row_f, text="包含子文件夹中的文件",
+                         variable=self.toolbox_recursive).grid(row=0, column=0, sticky="w")
+        r += 1
+
+        # 生成按钮
+        self.toolbox_run_btn = ctk.CTkButton(
+            main, text="▶  生成 Excel",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            height=38, corner_radius=8,
+            command=lambda: self._run_toolbox(dlg),
+        )
+        self.toolbox_run_btn.grid(row=r, column=0, columnspan=3,
+                                  sticky="ew", pady=(14, 6))
+        r += 1
+
+        # 状态
+        self.toolbox_status = ctk.CTkLabel(
+            main, text="", text_color="gray", wraplength=520, justify="left",
+        )
+        self.toolbox_status.grid(row=r, column=0, columnspan=3,
+                                 sticky="w", pady=(2, 0))
+
+    def _browse_toolbox_folder(self):
+        path = filedialog.askdirectory(title="选择文件夹")
+        if path:
+            self.toolbox_folder.set(path)
+            if not self.toolbox_output.get().strip():
+                self.toolbox_output.set(os.path.join(path, "文件名称汇总.xlsx"))
+
+    def _run_toolbox(self, dlg):
+        if getattr(self, "_toolbox_running", False):
+            return
+
+        folder = self.toolbox_folder.get().strip()
+        if not folder or not os.path.isdir(folder):
+            self.toolbox_status.configure(
+                text="请选择有效的文件夹", text_color="#CC3333")
+            return
+
+        self._toolbox_running = True
+        self.toolbox_run_btn.configure(text="⏳  生成中...", state="disabled")
+        self.toolbox_status.configure(text="正在生成...", text_color="gray")
+        thread = threading.Thread(target=self._toolbox_worker, daemon=True)
+        thread.start()
+
+    def _toolbox_worker(self):
+        try:
+            self._toolbox_internal()
+        except Exception as e:
+            error_text = str(e)
+            self.after(0, lambda: self._toolbox_update_status(
+                f"生成失败：{error_text}", "#CC3333"))
+        finally:
+            self._toolbox_running = False
+            self.after(0, self._toolbox_restore_button)
+
+    def _toolbox_restore_button(self):
+        if getattr(self, "toolbox_run_btn", None) and self.toolbox_run_btn.winfo_exists():
+            self.toolbox_run_btn.configure(text="▶  生成 Excel", state="normal")
+
+    def _toolbox_update_status(self, text, color="gray"):
+        if getattr(self, "toolbox_status", None) and self.toolbox_status.winfo_exists():
+            self.toolbox_status.configure(text=text, text_color=color)
+
+    def _toolbox_internal(self):
+        folder = self.toolbox_folder.get().strip()
+        output_path = self.toolbox_output.get().strip() or os.path.join(
+            folder, "文件名称汇总.xlsx")
+        recursive = self.toolbox_recursive.get()
+        output_abs = os.path.abspath(output_path)
+
+        rows = []
+        if recursive:
+            for root, _dirs, files in os.walk(folder):
+                for name in files:
+                    full_path = os.path.join(root, name)
+                    if os.path.abspath(full_path) == output_abs:
+                        continue
+                    rel_dir = os.path.relpath(root, folder)
+                    rows.append({
+                        "文件名": name,
+                        "所在文件夹": "" if rel_dir == "." else rel_dir,
+                        "完整路径": full_path,
+                    })
+        else:
+            for name in sorted(os.listdir(folder)):
+                full_path = os.path.join(folder, name)
+                if os.path.isfile(full_path) and os.path.abspath(full_path) != output_abs:
+                    rows.append({
+                        "文件名": name,
+                        "所在文件夹": "",
+                        "完整路径": full_path,
+                    })
+
+        if not rows:
+            self.after(0, lambda: self._toolbox_update_status(
+                "所选文件夹内没有文件", "#CC6600"))
+            return
+
+        rows.sort(key=lambda row: (row["所在文件夹"], row["文件名"]))
+        df = pd.DataFrame(rows)
+        df.insert(0, "序号", range(1, len(df) + 1))
+
+        parent = os.path.dirname(output_abs)
+        os.makedirs(parent, exist_ok=True)
+        df.to_excel(output_path, index=False)
+
+        self._log_success(f"工具箱：已汇总 {len(df)} 个文件名称 -> {output_path}")
+        self.after(0, lambda: self._toolbox_update_status(
+            f"已生成，共 {len(df)} 个文件", "#339933"))
 
     def _on_non_tax_mode_change(self):
         if hasattr(self, 'non_tax_account_entry'):
